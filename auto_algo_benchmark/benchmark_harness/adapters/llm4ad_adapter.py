@@ -40,7 +40,7 @@ class LLM4ADAdapter(FrameworkAdapter):
                     task_description=llm4ad_task_description(task),
                     timeout_seconds=timeout_seconds,
                     random_seed=None,
-                    safe_evaluate=True,
+                    safe_evaluate=False,
                 )
 
             def evaluate_program(self, program_str: str, callable_func: callable, **kwargs):
