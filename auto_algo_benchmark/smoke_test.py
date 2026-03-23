@@ -19,6 +19,3 @@ if __name__ == "__main__":
     task = builtin_task_specs({"budget": 40, "eval_seeds": [1, 2, 3]})["mixed_5d"]
     result = evaluate_solver_callable(solve, task)
     print(result)
-
-
-# 
