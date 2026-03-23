@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import os
-import re
 import traceback
 from pathlib import Path
 from typing import Any
 
 from .base import FrameworkAdapter
-from ..tasks import BenchmarkTask, evaluate_solver_callable, llamea_task_prompt, score_from_best_f, validate_python_code
-from ..utils import ResourceMonitor, RunSummary, ensure_dir, import_from_repo, pushd, safe_float
+from ..tasks import (
+    BenchmarkTask,
+    evaluate_solver_callable,
+    llamea_task_prompt,
+    score_from_best_f,
+    validate_python_code,
+)
+from ..utils import (
+    ResourceMonitor,
+    RunSummary,
+    ensure_dir,
+    import_from_repo,
+    pushd,
+    safe_float,
+)
 
 
 PENALTY_SCORE = score_from_best_f(1e12)
@@ -31,29 +43,43 @@ class LLAMEAAdapter(FrameworkAdapter):
                 text = stripped[len("python"):].lstrip()
         return text.strip()
 
-    @staticmethod
-    def _patch_llamea_logger() -> None:
+    def _patch_llamea_logger(self) -> None:
         import llamea.loggers as llamea_loggers  # type: ignore
+        import llamea.llamea as llamea_core  # type: ignore
 
-        if getattr(llamea_loggers.ExperimentLogger, "_benchmark_patch_applied", False):
+        if getattr(llamea_loggers, "_auto_algo_benchmark_patch_applied", False):
             return
 
-        def create_log_dir(self, name=""):
-            safe_name = re.sub(r'[<>:"/\\|?*]+', "_", str(name)).strip(" .")
-            today = self.working_date
-            dirname = f"exp-{today}-{safe_name}" if safe_name else f"exp-{today}"
-            candidate = Path(dirname)
-            suffix = 1
-            while candidate.exists():
-                candidate = Path(f"{dirname}_{suffix}")
-                suffix += 1
-            os.mkdir(candidate)
-            os.mkdir(candidate / "configspace")
-            os.mkdir(candidate / "code")
-            return str(candidate)
+        def safe_create_log_dir(logger_self, name: str = ""):
+            """
+            Keep LLaMEA logs inside the benchmark output directory and avoid
+            crashes if directories already exist.
+            """
+            model_name = str(name).split("/")[-1].replace(":", "_").replace("/", "_")
+            today = getattr(logger_self, "working_date", "run")
 
-        llamea_loggers.ExperimentLogger.create_log_dir = create_log_dir
-        llamea_loggers.ExperimentLogger._benchmark_patch_applied = True
+            base_dir = os.path.join(str(self.output_dir), "llamea_logs")
+            os.makedirs(base_dir, exist_ok=True)
+
+            dirname = os.path.join(base_dir, f"exp-{today}-{model_name}")
+            os.makedirs(dirname, exist_ok=True)
+            os.makedirs(os.path.join(dirname, "configspace"), exist_ok=True)
+            os.makedirs(os.path.join(dirname, "code"), exist_ok=True)
+            return dirname
+
+        def safe_pickle_archive(_llamea_self):
+            """
+            Disable LLaMEA self-pickling inside the benchmark harness.
+
+            The benchmark adapter uses a local evaluation closure, which is not
+            picklable on Windows. LLaMEA tries to pickle itself during __init__,
+            which crashes the run before any real benchmark work happens.
+            """
+            return None
+
+        llamea_loggers.ExperimentLogger.create_log_dir = safe_create_log_dir
+        llamea_core.LLaMEA.pickle_archive = safe_pickle_archive
+        llamea_loggers._auto_algo_benchmark_patch_applied = True
 
     def run_one(self, task: BenchmarkTask, seed: int) -> tuple[RunSummary, list[dict[str, Any]]]:
         import_from_repo(self.framework_cfg["repo_path"], "llamea")
@@ -63,6 +89,7 @@ class LLAMEAAdapter(FrameworkAdapter):
 
         run_dir = ensure_dir(self.output_dir / "artifacts" / "llamea" / task.name / f"seed_{seed}")
         failure_log_path = run_dir / "failure_examples.txt"
+
         os.environ["OLLAMA_HOST"] = self.global_cfg["ollama"]["base_url"]
 
         budget = int(self.framework_cfg.get("search_budget", 12))
@@ -77,6 +104,7 @@ class LLAMEAAdapter(FrameworkAdapter):
         def evaluate(solution, explogger=None):
             nonlocal failure_count
             code = self._strip_code_fences(getattr(solution, "code", ""))
+
             try:
                 validate_python_code(code)
                 local_ns: dict[str, Any] = {}
@@ -85,20 +113,24 @@ class LLAMEAAdapter(FrameworkAdapter):
                     {"np": __import__("numpy"), "numpy": __import__("numpy"), "__builtins__": __builtins__},
                     local_ns,
                 )
+
                 solver = local_ns.get("solve")
                 if solver is None:
                     raise ValueError("Generated code does not define a top-level solve()")
+
                 result = evaluate_solver_callable(solver, task)
                 solution.add_metadata("raw_objective_mean", result["raw_objective_mean"])
                 solution.add_metadata("per_problem", result["per_problem"])
                 solution.add_metadata("fail_reason", "")
                 solution.set_scores(result["fitness"], f"Benchmark fitness: {result['fitness']:.6f}")
+
             except Exception as exc:
                 failure_reason = f"{type(exc).__name__}: {exc}"
                 solution.add_metadata("raw_objective_mean", 1e12)
                 solution.add_metadata("per_problem", [])
                 solution.add_metadata("fail_reason", failure_reason)
                 solution.set_scores(float(PENALTY_SCORE), f"Execution failed: {exc}", exc)
+
                 if failure_count < 10:
                     with failure_log_path.open("a", encoding="utf-8") as f:
                         f.write(f"task={task.name} seed={seed} failure={failure_reason}\n")
@@ -106,6 +138,7 @@ class LLAMEAAdapter(FrameworkAdapter):
                         f.write(code)
                         f.write("\n----- GENERATED CODE END -----\n\n")
                     failure_count += 1
+
             return solution
 
         llm = Ollama_LLM(model=model_name)
@@ -135,18 +168,23 @@ class LLAMEAAdapter(FrameworkAdapter):
                     elitism=True,
                     log=True,
                 )
+
                 best = es.run()
                 candidates_evaluated = len(es.run_history)
                 running_best = float("-inf")
+
                 for idx, sol in enumerate(es.run_history, start=1):
                     score = safe_float(getattr(sol, "fitness", None))
                     if score is None:
                         score = float(PENALTY_SCORE)
+
                     running_best = max(running_best, score)
                     fail_reason = ""
+
                     metadata = getattr(sol, "metadata", {}) or {}
                     if isinstance(metadata, dict):
                         fail_reason = str(metadata.get("fail_reason", "") or "")
+
                     progress_rows.append(
                         {
                             "framework": "llamea",
@@ -160,21 +198,30 @@ class LLAMEAAdapter(FrameworkAdapter):
                             "fail_reason": fail_reason,
                         }
                     )
+
                 best_score = safe_float(getattr(best, "fitness", None))
-                best_raw = safe_float(getattr(best, "metadata", {}).get("raw_objective_mean")) if hasattr(best, "metadata") else None
+                best_raw = (
+                    safe_float(getattr(best, "metadata", {}).get("raw_objective_mean"))
+                    if hasattr(best, "metadata")
+                    else None
+                )
                 artifact_dir = str(Path(getattr(getattr(es, "logger", None), "dirname", run_dir)).resolve())
+
             runtime_sec = monitor.runtime_sec
             peak_rss_mb = monitor.peak_rss_mb
+
             if best_score is None or best_score <= PENALTY_SCORE + 1e-9:
                 status = "no_valid_candidate"
                 notes = "All generated candidates fell back to the penalty baseline. See failure_examples.txt for examples."
             elif failure_log_path.exists():
                 notes = "Some candidates failed validation or execution. See failure_examples.txt for examples."
+
         except Exception as exc:
             status = "failed"
             notes = f"{type(exc).__name__}: {exc}"
             runtime_sec = 0.0
             peak_rss_mb = None
+
             progress_rows.append(
                 {
                     "framework": "llamea",
