@@ -28,7 +28,7 @@ def builtin_task_specs(task_defaults: dict[str, Any]) -> dict[str, BenchmarkTask
         "sphere_5d": BenchmarkTask("sphere_5d", "sphere", 5, budget, lower_bound, upper_bound, eval_seeds),
         "rastrigin_5d": BenchmarkTask("rastrigin_5d", "rastrigin", 5, budget, lower_bound, upper_bound, eval_seeds),
         "rosenbrock_5d": BenchmarkTask("rosenbrock_5d", "rosenbrock", 5, budget, lower_bound, upper_bound, eval_seeds),
-        "mixed_5d": BenchmarkTask("mixed_5d", "mixed", 5, budget, lower_bound, upper_bound, eval_seeds)
+        "mixed_5d": BenchmarkTask("mixed_5d", "mixed", 5, budget, lower_bound, upper_bound, eval_seeds),
     }
 
 
@@ -65,7 +65,7 @@ def score_from_best_f(best_f: float) -> float:
 
 def validate_python_code(code: str) -> None:
     tree = ast.parse(code)
-    allowed_roots = {"numpy", "np", "math","random"}
+    allowed_roots = {"numpy", "np", "math", "random"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -144,8 +144,8 @@ def evaluate_solver_callable(solver, task: BenchmarkTask) -> dict[str, Any]:
     for objective_name in objective_names_for_task(task):
         fn = make_objective(objective_name)
         seed_best_fs = []
+
         for seed in task.eval_seeds:
-            rng = np.random.default_rng(seed)
             wrapped = BudgetedObjective(fn, task.budget)
             best_f = float("inf")
             hist = []
@@ -162,6 +162,7 @@ def evaluate_solver_callable(solver, task: BenchmarkTask) -> dict[str, Any]:
             except Exception:
                 best_f = float("inf")
                 hist = []
+
             if not np.isfinite(best_f):
                 best_f = 1e12
             if not hist:
@@ -169,13 +170,16 @@ def evaluate_solver_callable(solver, task: BenchmarkTask) -> dict[str, Any]:
             best_f = min(best_f, min(hist))
             seed_best_fs.append(best_f)
             all_scores.append(score_from_best_f(best_f))
+
         problem_mean = float(np.mean(seed_best_fs))
         objective_means.append(problem_mean)
-        per_problem.append({
-            "objective": objective_name,
-            "mean_best_f": problem_mean,
-            "score": float(np.mean([score_from_best_f(x) for x in seed_best_fs]))
-        })
+        per_problem.append(
+            {
+                "objective": objective_name,
+                "mean_best_f": problem_mean,
+                "score": float(np.mean([score_from_best_f(x) for x in seed_best_fs])),
+            }
+        )
 
     return {
         "fitness": float(np.mean(all_scores)),
@@ -197,7 +201,7 @@ def solve(objective, budget, dim, lower_bound, upper_bound, seed):
 ```
 
 Rules:
-- Use only numpy and optionally math.
+- Use only numpy, math, and optionally random.
 - The goal is to MINIMIZE the objective.
 - Never call `objective` more than `budget` times.
 - Respect the scalar box bounds [`lower_bound`, `upper_bound`] in every candidate vector.
@@ -207,6 +211,8 @@ Rules:
   2. a tuple `(best_x, best_f, history)`.
 - `history` should be the best-so-far objective values over time.
 - Keep the code self-contained.
+- Do not use scipy or any other external library.
+- Do not output explanations, only valid Python code.
 
 The optimizer will be evaluated on: {objectives}.
 Dimension: {task.dim}
@@ -219,6 +225,7 @@ Higher benchmark score is achieved by obtaining lower final objective values.
 def llm4ad_template_program() -> str:
     return """
 import math
+import random
 import numpy as np
 
 def solve(objective, budget, dim, lower_bound, upper_bound, seed):
@@ -247,7 +254,8 @@ def llm4ad_task_description(task: BenchmarkTask) -> str:
 Improve the body of the Python function `solve(objective, budget, dim, lower_bound, upper_bound, seed)`.
 
 The function must implement a continuous black-box optimizer that minimizes the objective value.
-Use only numpy and optionally math.
+Use only numpy, math, and optionally random.
+Do not use scipy or any other external library.
 Do not exceed the evaluation budget.
 Return a dict with keys `best_x`, `best_f`, and `history`.
 

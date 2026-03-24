@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import traceback
 from pathlib import Path
@@ -36,6 +37,7 @@ class LLM4ADAdapter(FrameworkAdapter):
         num_evaluators = int(self.framework_cfg.get("num_evaluators", 1))
         model_name = self.global_cfg["ollama"]["model"]
         base_url = self.global_cfg["ollama"]["base_url"]
+        os.environ["OLLAMA_HOST"] = base_url
         safe_evaluate = bool(self.framework_cfg.get("safe_evaluate", True))
         daemon_eval_process = bool(self.framework_cfg.get("daemon_eval_process", False))
         fork_proc = self.framework_cfg.get("fork_proc", "auto")
@@ -49,9 +51,10 @@ class LLM4ADAdapter(FrameworkAdapter):
                     template_program=llm4ad_template_program(),
                     task_description=llm4ad_task_description(task),
                     timeout_seconds=timeout_seconds,
-
-                    random_seed=None,
-                    safe_evaluate=False,
+                    random_seed=seed,
+                    safe_evaluate=safe_evaluate,
+                    daemon_eval_process=daemon_eval_process,
+                    fork_proc=fork_proc,
                 )
 
             def evaluate_program(self, program_str: str, callable_func: callable, **kwargs):
