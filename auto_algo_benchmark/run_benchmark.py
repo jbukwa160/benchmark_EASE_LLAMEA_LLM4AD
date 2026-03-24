@@ -23,8 +23,10 @@ def main():
     if not args.skip_analysis:
         config_path = Path(args.config).resolve()
 
-        # results dir matches your config style: "../benchmark_results"
-        results_dir = (config_path.parent / "../benchmark_results").resolve()
+        import json
+        with config_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        results_dir = (config_path.parent / cfg.get("output_dir", "benchmark_results")).resolve()
 
         print(f"\nBenchmark finished. Running analysis on: {results_dir}\n")
 

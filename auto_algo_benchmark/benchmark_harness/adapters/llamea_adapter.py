@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -43,9 +44,11 @@ class LLAMEAAdapter(FrameworkAdapter):
                 text = stripped[len("python"):].lstrip()
         return text.strip()
 
-    def _patch_llamea_logger(self) -> None:
+    def _patch_llamea_runtime(self) -> None:
         import llamea.loggers as llamea_loggers  # type: ignore
         import llamea.llamea as llamea_core  # type: ignore
+        import llamea.llm as llamea_llm  # type: ignore
+        import ollama  # type: ignore
 
         if getattr(llamea_loggers, "_auto_algo_benchmark_patch_applied", False):
             return
@@ -77,13 +80,45 @@ class LLAMEAAdapter(FrameworkAdapter):
             """
             return None
 
+        def patched_ollama_init(ollama_self, model="llama3.2", base_url=None, **kwargs):
+            llamea_llm.LLM.__init__(ollama_self, "", model, None, **kwargs)
+            env_base = os.environ.get("OLLAMA_HOST")
+            ollama_self.base_url = base_url or env_base
+            ollama_self.client = ollama.Client(host=ollama_self.base_url) if ollama_self.base_url else ollama.Client()
+
+        def patched_ollama_query(ollama_self, session_messages, max_retries: int = 5, default_delay: int = 10):
+            big_message = ""
+            for msg in session_messages:
+                big_message += msg["content"] + "\n"
+
+            attempt = 0
+            while True:
+                try:
+                    response = ollama_self.client.chat(
+                        model=ollama_self.model,
+                        messages=[{"role": "user", "content": big_message}],
+                    )
+                    return response["message"]["content"]
+                except ollama.ResponseError as err:
+                    attempt += 1
+                    if attempt > max_retries or getattr(err, "status_code", None) not in (429, 500, 503):
+                        raise
+                    time.sleep(default_delay * attempt)
+                except Exception:
+                    attempt += 1
+                    if attempt > max_retries:
+                        raise
+                    time.sleep(default_delay * attempt)
+
         llamea_loggers.ExperimentLogger.create_log_dir = safe_create_log_dir
         llamea_core.LLaMEA.pickle_archive = safe_pickle_archive
+        llamea_llm.Ollama_LLM.__init__ = patched_ollama_init
+        llamea_llm.Ollama_LLM.query = patched_ollama_query
         llamea_loggers._auto_algo_benchmark_patch_applied = True
 
     def run_one(self, task: BenchmarkTask, seed: int) -> tuple[RunSummary, list[dict[str, Any]]]:
         import_from_repo(self.framework_cfg["repo_path"], "llamea")
-        self._patch_llamea_logger()
+        self._patch_llamea_runtime()
 
         from llamea import LLaMEA, Ollama_LLM  # type: ignore
 
@@ -98,6 +133,7 @@ class LLAMEAAdapter(FrameworkAdapter):
         max_workers = int(self.framework_cfg.get("max_workers", 1))
         eval_timeout = int(self.framework_cfg.get("eval_timeout", 1200))
         model_name = self.global_cfg["ollama"]["model"]
+        base_url = self.global_cfg["ollama"]["base_url"]
 
         failure_count = 0
 
@@ -141,7 +177,7 @@ class LLAMEAAdapter(FrameworkAdapter):
 
             return solution
 
-        llm = Ollama_LLM(model=model_name)
+        llm = Ollama_LLM(model=model_name, base_url=base_url)
 
         progress_rows: list[dict[str, Any]] = []
         best_raw = None
