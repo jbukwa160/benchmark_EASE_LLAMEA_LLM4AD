@@ -51,10 +51,9 @@ class LLM4ADAdapter(FrameworkAdapter):
                     template_program=llm4ad_template_program(),
                     task_description=llm4ad_task_description(task),
                     timeout_seconds=timeout_seconds,
-                    random_seed=seed,
-                    safe_evaluate=safe_evaluate,
-                    daemon_eval_process=daemon_eval_process,
-                    fork_proc=fork_proc,
+
+                    random_seed=None,
+                    safe_evaluate=False,
                 )
 
             def evaluate_program(self, program_str: str, callable_func: callable, **kwargs):

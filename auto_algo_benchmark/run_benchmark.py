@@ -19,6 +19,7 @@ def main():
     sys.argv = ["run_benchmark.py", "--config", args.config]
     if args.append:
         sys.argv.append("--append")
+
     run_cli()
 
     if not args.skip_analysis:
