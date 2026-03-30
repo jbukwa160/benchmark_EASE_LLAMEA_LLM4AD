@@ -7,7 +7,7 @@ from pathlib import Path
 from .adapters import EaseAdapter, LLM4ADAdapter, LLAMEAAdapter
 from .config import load_config
 from .tasks import builtin_task_specs
-from .utils import RunSummary, append_csv_row, ensure_dir
+from .utils import append_csv_row, ensure_dir
 
 
 PROGRESS_FIELDS = [
@@ -18,6 +18,8 @@ PROGRESS_FIELDS = [
     "elapsed_sec",
     "candidate_score",
     "best_so_far",
+    "is_valid_candidate",
+    "fail_reason",
 ]
 
 
@@ -36,6 +38,7 @@ def build_adapters(cfg: dict, output_dir: Path):
 def run_cli() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument("--append", action="store_true", help="Append to existing CSV files instead of replacing them")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -43,10 +46,12 @@ def run_cli() -> None:
 
     summary_csv = output_dir / "summary.csv"
     progress_csv = output_dir / "progress.csv"
-    if summary_csv.exists():
-        summary_csv.unlink()
-    if progress_csv.exists():
-        progress_csv.unlink()
+    append_mode = bool(args.append or cfg.get("append_results", False))
+    if not append_mode:
+        if summary_csv.exists():
+            summary_csv.unlink()
+        if progress_csv.exists():
+            progress_csv.unlink()
 
     task_specs = builtin_task_specs(cfg.get("task_defaults", {}))
     tasks = [task_specs[name] for name in cfg.get("tasks", [])]
