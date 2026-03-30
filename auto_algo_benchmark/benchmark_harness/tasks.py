@@ -65,7 +65,7 @@ def score_from_best_f(best_f: float) -> float:
 
 def validate_python_code(code: str) -> None:
     tree = ast.parse(code)
-    allowed_roots = {"numpy", "np", "math", "random"}
+    allowed_roots = {"numpy", "np", "math","random"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
