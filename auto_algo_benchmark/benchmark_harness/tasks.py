@@ -197,7 +197,7 @@ def solve(objective, budget, dim, lower_bound, upper_bound, seed):
 ```
 
 Rules:
-- Use only numpy and optionally math.
+- Use only numpy, math and optionally random.
 - The goal is to MINIMIZE the objective.
 - Never call `objective` more than `budget` times.
 - Respect the scalar box bounds [`lower_bound`, `upper_bound`] in every candidate vector.
@@ -247,7 +247,7 @@ def llm4ad_task_description(task: BenchmarkTask) -> str:
 Improve the body of the Python function `solve(objective, budget, dim, lower_bound, upper_bound, seed)`.
 
 The function must implement a continuous black-box optimizer that minimizes the objective value.
-Use only numpy and optionally math.
+Use only numpy, math and optionally random.
 Do not exceed the evaluation budget.
 Return a dict with keys `best_x`, `best_f`, and `history`.
 
