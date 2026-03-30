@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
+import random
 import time
 import traceback
 from pathlib import Path
 from typing import Any
-import random
 
 from .base import FrameworkAdapter
 from ..tasks import (
@@ -15,14 +16,7 @@ from ..tasks import (
     score_from_best_f,
     validate_python_code,
 )
-from ..utils import (
-    ResourceMonitor,
-    RunSummary,
-    ensure_dir,
-    import_from_repo,
-    pushd,
-    safe_float,
-)
+from ..utils import ResourceMonitor, RunSummary, import_from_repo, pushd, safe_float
 
 
 PENALTY_SCORE = score_from_best_f(1e12)
@@ -55,10 +49,6 @@ class LLAMEAAdapter(FrameworkAdapter):
             return
 
         def safe_create_log_dir(logger_self, name: str = ""):
-            """
-            Keep LLaMEA logs inside the benchmark output directory and avoid
-            crashes if directories already exist.
-            """
             model_name = str(name).split("/")[-1].replace(":", "_").replace("/", "_")
             today = getattr(logger_self, "working_date", "run")
 
@@ -72,13 +62,6 @@ class LLAMEAAdapter(FrameworkAdapter):
             return dirname
 
         def safe_pickle_archive(_llamea_self):
-            """
-            Disable LLaMEA self-pickling inside the benchmark harness.
-
-            The benchmark adapter uses a local evaluation closure, which is not
-            picklable on Windows. LLaMEA tries to pickle itself during __init__,
-            which crashes the run before any real benchmark work happens.
-            """
             return None
 
         def patched_ollama_init(ollama_self, model="llama3.2", base_url=None, **kwargs):
@@ -90,8 +73,7 @@ class LLAMEAAdapter(FrameworkAdapter):
         def patched_ollama_query(ollama_self, session_messages, max_retries: int = 5, default_delay: int = 10):
             big_message = ""
             for msg in session_messages:
-                big_message += msg["content"] + "\n"
-
+                big_message += msg["content"] + ""
             attempt = 0
             while True:
                 try:
@@ -122,11 +104,10 @@ class LLAMEAAdapter(FrameworkAdapter):
         self._patch_llamea_runtime()
 
         from llamea import LLaMEA, Ollama_LLM  # type: ignore
+        import numpy as np
 
-        run_dir = ensure_dir(self.output_dir / "artifacts" / "llamea" / task.name / f"seed_{seed}")
-        run_dir = Path(run_dir)
+        run_dir = Path(self.output_dir) / "artifacts" / "llamea" / task.name / f"seed_{seed}"
         run_dir.mkdir(parents=True, exist_ok=True)
-
         failure_log_path = run_dir / "failure_examples.txt"
 
         os.environ["OLLAMA_HOST"] = self.global_cfg["ollama"]["base_url"]
@@ -147,14 +128,20 @@ class LLAMEAAdapter(FrameworkAdapter):
 
             try:
                 validate_python_code(code)
+
                 local_ns: dict[str, Any] = {}
-                exec(
-                    code,
-                    {"np": __import__("numpy"), "numpy": __import__("numpy"), "__builtins__": __builtins__},
-                    local_ns,
-                )
+                exec_globals = {
+                    "np": np,
+                    "numpy": np,
+                    "math": math,
+                    "random": random,
+                    "__builtins__": __builtins__,
+                }
+                exec(code, exec_globals, local_ns)
 
                 solver = local_ns.get("solve")
+                if solver is None:
+                    solver = exec_globals.get("solve")
                 if solver is None:
                     raise ValueError("Generated code does not define a top-level solve()")
 
@@ -171,13 +158,17 @@ class LLAMEAAdapter(FrameworkAdapter):
                 solution.add_metadata("fail_reason", failure_reason)
                 solution.set_scores(float(PENALTY_SCORE), f"Execution failed: {exc}", exc)
 
-                if failure_count < 10:
-                    with failure_log_path.open("a", encoding="utf-8") as f:
-                        f.write(f"task={task.name} seed={seed} failure={failure_reason}\n")
-                        f.write("----- GENERATED CODE START -----\n")
-                        f.write(code)
-                        f.write("\n----- GENERATED CODE END -----\n\n")
-                    failure_count += 1
+                if failure_count < 50:
+                    try:
+                        failure_log_path.parent.mkdir(parents=True, exist_ok=True)
+                        with failure_log_path.open("a", encoding="utf-8") as f:
+                            f.write(f"task={task.name} seed={seed} failure={failure_reason}\n")
+                            f.write("----- GENERATED CODE START -----\n")
+                            f.write(code)
+                            f.write("\n----- GENERATED CODE END -----\n\n")
+                        failure_count += 1
+                    except Exception:
+                        pass
 
             return solution
 
@@ -220,7 +211,6 @@ class LLAMEAAdapter(FrameworkAdapter):
 
                     running_best = max(running_best, score)
                     fail_reason = ""
-
                     metadata = getattr(sol, "metadata", {}) or {}
                     if isinstance(metadata, dict):
                         fail_reason = str(metadata.get("fail_reason", "") or "")
@@ -240,11 +230,7 @@ class LLAMEAAdapter(FrameworkAdapter):
                     )
 
                 best_score = safe_float(getattr(best, "fitness", None))
-                best_raw = (
-                    safe_float(getattr(best, "metadata", {}).get("raw_objective_mean"))
-                    if hasattr(best, "metadata")
-                    else None
-                )
+                best_raw = safe_float(getattr(best, "metadata", {}).get("raw_objective_mean")) if hasattr(best, "metadata") else None
                 artifact_dir = str(Path(getattr(getattr(es, "logger", None), "dirname", run_dir)).resolve())
 
             runtime_sec = monitor.runtime_sec
@@ -261,7 +247,6 @@ class LLAMEAAdapter(FrameworkAdapter):
             notes = f"{type(exc).__name__}: {exc}"
             runtime_sec = 0.0
             peak_rss_mb = None
-
             progress_rows.append(
                 {
                     "framework": "llamea",

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from benchmark_harness.cli import run_cli
+from benchmark_harness.config import load_config
 
 
 def main():
@@ -13,22 +14,19 @@ def main():
     parser.add_argument("--skip-analysis", action="store_true")
     args = parser.parse_args()
 
-    # Run benchmark first
+    cfg = load_config(args.config)
+
     sys.argv = ["run_benchmark.py", "--config", args.config]
     if args.append:
         sys.argv.append("--append")
     run_cli()
 
-    # Then run analysis automatically
     if not args.skip_analysis:
         config_path = Path(args.config).resolve()
+        output_dir_cfg = cfg.get("output_dir", "benchmark_results")
+        results_dir = (config_path.parent / output_dir_cfg).resolve()
 
-        import json
-        with config_path.open("r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        results_dir = (config_path.parent / cfg.get("output_dir", "benchmark_results")).resolve()
-
-        print(f"\nBenchmark finished. Running analysis on: {results_dir}\n")
+        print(f"Benchmark finished. Running analysis on: {results_dir}")
 
         subprocess.run(
             [
