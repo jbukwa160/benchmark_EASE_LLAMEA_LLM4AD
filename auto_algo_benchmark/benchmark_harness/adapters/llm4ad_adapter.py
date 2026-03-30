@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import traceback
 from pathlib import Path
@@ -21,14 +22,11 @@ class LLM4ADAdapter(FrameworkAdapter):
     def run_one(self, task: BenchmarkTask, seed: int) -> tuple[RunSummary, list[dict[str, Any]]]:
         import_from_repo(self.framework_cfg["repo_path"], "llm4ad")
 
-        import os
         from llm4ad.base import Evaluation  # type: ignore
         from llm4ad.method.eoh import EoH, EoHProfiler  # type: ignore
         from llm4ad.tools.llm.local_ollama import LocalOllamaLLM  # type: ignore
 
         run_dir = ensure_dir(self.output_dir / "artifacts" / "llm4ad" / task.name / f"seed_{seed}")
-
-        os.environ["OLLAMA_HOST"] = self.global_cfg["ollama"]["base_url"]
 
         timeout_seconds = int(self.framework_cfg.get("timeout_seconds", 1200))
         max_sample_nums = int(self.framework_cfg.get("max_sample_nums", 12))
@@ -39,6 +37,7 @@ class LLM4ADAdapter(FrameworkAdapter):
         num_evaluators = int(self.framework_cfg.get("num_evaluators", 1))
         model_name = self.global_cfg["ollama"]["model"]
         base_url = self.global_cfg["ollama"]["base_url"]
+        os.environ["OLLAMA_HOST"] = base_url
         safe_evaluate = bool(self.framework_cfg.get("safe_evaluate", True))
         daemon_eval_process = bool(self.framework_cfg.get("daemon_eval_process", False))
         fork_proc = self.framework_cfg.get("fork_proc", "auto")
