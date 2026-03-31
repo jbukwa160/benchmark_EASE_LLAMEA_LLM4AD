@@ -6,6 +6,7 @@ import os
 import random
 import time
 import traceback
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -169,12 +170,14 @@ class LLAMEAAdapter(FrameworkAdapter):
         llamea_loggers._auto_algo_benchmark_patch_applied = True
 
     def run_one(self, task: BenchmarkTask, seed: int) -> tuple[RunSummary, list[dict[str, Any]]]:
+        run_dir = Path(self.output_dir) / "artifacts" / "llamea" / task.name / f"seed_{seed}"
+        _write_live_snapshot(run_dir, task, seed, [])
+
         import_from_repo(self.framework_cfg["repo_path"], "llamea")
         self._patch_llamea_runtime()
 
         from llamea import LLaMEA, Ollama_LLM  # type: ignore
 
-        run_dir = Path(self.output_dir) / "artifacts" / "llamea" / task.name / f"seed_{seed}"
         run_dir.mkdir(parents=True, exist_ok=True)
         failure_log_path = run_dir / "failure_examples.txt"
 
@@ -211,7 +214,9 @@ class LLAMEAAdapter(FrameworkAdapter):
                     validate_python_code(code)
                     exec_globals = get_safe_exec_globals()
                     local_ns: dict[str, Any] = {}
-                    exec(code, exec_globals, local_ns)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", RuntimeWarning)
+                        exec(code, exec_globals, local_ns)
 
                     solver = local_ns.get("solve")
                     if solver is None:
@@ -219,7 +224,9 @@ class LLAMEAAdapter(FrameworkAdapter):
                     if solver is None or not callable(solver):
                         raise ValueError("Generated code does not define a top-level solve()")
 
-                    result = evaluate_solver_callable(solver, task, skip_baseline=current_skip)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", RuntimeWarning)
+                        result = evaluate_solver_callable(solver, task, skip_baseline=current_skip)
                     solution.add_metadata("raw_objective_mean", result["raw_objective_mean"])
                     solution.add_metadata("per_problem", result["per_problem"])
                     solution.add_metadata("fail_reason", "")
@@ -231,6 +238,23 @@ class LLAMEAAdapter(FrameworkAdapter):
                     solution.add_metadata("per_problem", [])
                     solution.add_metadata("fail_reason", fail_reason)
                     solution.set_scores(float(PENALTY_SCORE), fail_reason)
+                except (RuntimeWarning, FloatingPointError, OverflowError) as exc:
+                    fail_reason = f"Numerical instability: {type(exc).__name__}: {exc}"
+                    solution.add_metadata("raw_objective_mean", 1e12)
+                    solution.add_metadata("per_problem", [])
+                    solution.add_metadata("fail_reason", fail_reason)
+                    solution.set_scores(float(PENALTY_SCORE), f"Execution failed: {exc}", exc)
+
+                    if failure_count < 50:
+                        try:
+                            with failure_log_path.open("a", encoding="utf-8") as f:
+                                f.write(f"task={task.name} seed={seed} failure={fail_reason}\n")
+                                f.write("----- GENERATED CODE START -----\n")
+                                f.write(code)
+                                f.write("\n----- GENERATED CODE END -----\n\n")
+                            failure_count += 1
+                        except Exception:
+                            pass
                 except Exception as exc:
                     fail_reason = f"{type(exc).__name__}: {exc}"
                     solution.add_metadata("raw_objective_mean", 1e12)
@@ -342,4 +366,10 @@ class LLAMEAAdapter(FrameworkAdapter):
             artifact_dir=artifact_dir,
             notes=notes,
         )
+        try:
+            _atomic_write_json(Path(run_dir) / "summary.live.json", dict(summary.__dict__))
+            if progress_rows:
+                _atomic_write_json(Path(run_dir) / "progress_rows.live.json", progress_rows)
+        except Exception:
+            pass
         return summary, progress_rows
