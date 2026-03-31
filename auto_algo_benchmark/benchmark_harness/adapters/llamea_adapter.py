@@ -395,7 +395,7 @@ def _run_llm4ad_task_worker(
         )
 
 
-class LLM4ADAdapter(FrameworkAdapter):
+class LLAMEAAdapter(FrameworkAdapter):
     def __init__(self, framework_cfg: dict[str, Any], global_cfg: dict[str, Any], output_dir: str | Path):
         super().__init__("llm4ad", framework_cfg, global_cfg, output_dir)
 
