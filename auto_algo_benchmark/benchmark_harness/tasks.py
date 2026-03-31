@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ast
+import json
 import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -89,6 +92,29 @@ _SAFE_BUILTINS = {
     "zip": zip,
     "__import__": __import__,
 }
+
+
+class SkipCurrentGeneration(RuntimeError):
+    pass
+
+
+def _read_skip_request_count() -> int:
+    path_str = os.environ.get("BENCHMARK_SKIP_SIGNAL_FILE", "").strip()
+    if not path_str:
+        return 0
+    path = Path(path_str)
+    if not path.exists():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    for key in ("skip_count", "generation"):
+        try:
+            return int(payload.get(key, 0) or 0)
+        except Exception:
+            continue
+    return 0
 
 
 @dataclass(frozen=True)
@@ -215,18 +241,21 @@ def validate_python_code(code: str) -> None:
 
 
 class BudgetedObjective:
-    def __init__(self, fn, budget: int, dim: int, lower_bound: float, upper_bound: float):
+    def __init__(self, fn, budget: int, dim: int, lower_bound: float, upper_bound: float, skip_baseline: int | None = None):
         self.fn = fn
         self.budget = int(budget)
         self.dim = int(dim)
         self.lower_bound = float(lower_bound)
         self.upper_bound = float(upper_bound)
+        self.skip_baseline = int(skip_baseline or 0)
         self.calls = 0
         self.best_f = float("inf")
         self.best_x: list[float] | None = None
         self.best_history: list[float] = []
 
     def __call__(self, x):
+        if _read_skip_request_count() > self.skip_baseline:
+            raise SkipCurrentGeneration("Skipped current generation from terminal")
         if self.calls >= self.budget:
             raise RuntimeError("Evaluation budget exceeded")
         self.calls += 1
@@ -320,7 +349,7 @@ def _coerce_result(result: Any) -> tuple[float | None, list[float], list[float] 
     return returned_best_f, returned_history, returned_best_x
 
 
-def evaluate_solver_callable(solver, task: BenchmarkTask) -> dict[str, Any]:
+def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int | None = None) -> dict[str, Any]:
     per_problem = []
     all_scores: list[float] = []
     objective_means: list[float] = []
@@ -332,7 +361,7 @@ def evaluate_solver_callable(solver, task: BenchmarkTask) -> dict[str, Any]:
         seed_calls: list[int] = []
 
         for seed in task.eval_seeds:
-            wrapped = BudgetedObjective(fn, task.budget, task.dim, task.lower_bound, task.upper_bound)
+            wrapped = BudgetedObjective(fn, task.budget, task.dim, task.lower_bound, task.upper_bound, skip_baseline=skip_baseline)
 
             try:
                 result = solver(
