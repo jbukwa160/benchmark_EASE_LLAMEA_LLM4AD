@@ -13,12 +13,9 @@ from benchmark_harness.cli import run_cli
 from benchmark_harness.config import load_config
 
 
-def _write_skip_generation(path: Path, skip_count: int) -> None:
+def _write_skip_signal(path: Path, skip_count: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"skip_count": int(skip_count), "generation": int(skip_count), "updated_at": time.time()}, indent=2),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps({"skip_count": int(skip_count), "updated_at": time.time()}, indent=2), encoding="utf-8")
 
 
 def _start_skip_key_listener(skip_signal_path: Path):
@@ -29,14 +26,14 @@ def _start_skip_key_listener(skip_signal_path: Path):
     stop_event = threading.Event()
 
     def notify_skip(skip_count: int) -> None:
-        _write_skip_generation(skip_signal_path, skip_count)
+        _write_skip_signal(skip_signal_path, skip_count)
         print(f"\nSkip requested for the current generation/candidate (request {skip_count}).")
-        print("The benchmark will penalize the active generation at the next safe checkpoint and then continue.")
+        print("The active evaluation will be penalized at the next safe checkpoint, then the run will continue.")
 
     def windows_listener() -> None:
         import msvcrt
 
-        generation = 0
+        skip_count = 0
         while not stop_event.is_set():
             if msvcrt.kbhit():
                 try:
@@ -44,8 +41,8 @@ def _start_skip_key_listener(skip_signal_path: Path):
                 except Exception:
                     ch = ""
                 if ch in ("s", "S"):
-                    generation += 1
-                    notify_skip(generation)
+                    skip_count += 1
+                    notify_skip(skip_count)
             time.sleep(0.1)
 
     def posix_listener() -> None:
@@ -53,7 +50,7 @@ def _start_skip_key_listener(skip_signal_path: Path):
         import termios
         import tty
 
-        generation = 0
+        skip_count = 0
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
@@ -67,8 +64,8 @@ def _start_skip_key_listener(skip_signal_path: Path):
                 except Exception:
                     ch = ""
                 if ch in ("s", "S"):
-                    generation += 1
-                    notify_skip(generation)
+                    skip_count += 1
+                    notify_skip(skip_count)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -95,7 +92,7 @@ def main():
 
     config_path = Path(args.config).resolve()
     skip_signal_path = Path(tempfile.gettempdir()) / f"benchmark_skip_signal_{os.getpid()}.json"
-    _write_skip_generation(skip_signal_path, 0)
+    _write_skip_signal(skip_signal_path, 0)
     os.environ["BENCHMARK_SKIP_SIGNAL_FILE"] = str(skip_signal_path)
 
     stop_listener = _start_skip_key_listener(skip_signal_path)
@@ -122,13 +119,12 @@ def main():
 
     output_dir_cfg = cfg.get("output_dir", "benchmark_results")
     results_dir = (config_path.parent / output_dir_cfg).resolve()
-    analysis_script = Path(__file__).with_name("analyze_benchmark.py")
-
     print(f"Benchmark finished. Running analysis on: {results_dir}")
+
     completed = subprocess.run(
         [
             sys.executable,
-            str(analysis_script),
+            str(Path(__file__).with_name("analyze_benchmark.py")),
             "--results-dir",
             str(results_dir),
         ],
