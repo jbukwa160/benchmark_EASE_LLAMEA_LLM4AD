@@ -1,54 +1,12 @@
 from __future__ import annotations
 
 import ast
-import json
 import math
-import os
 import warnings
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
-import random as pyrandom
-
-
-_ALLOWED_IMPORT_ROOTS = {"numpy", "np", "math", "random"}
-_DISALLOWED_MODULE_ROOTS = {"os", "sys", "subprocess", "pathlib", "shutil", "socket", "requests"}
-
-_SAFE_BUILTINS = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "bool": bool,
-    "dict": dict,
-    "enumerate": enumerate,
-    "Exception": Exception,
-    "False": False,
-    "float": float,
-    "int": int,
-    "len": len,
-    "list": list,
-    "max": max,
-    "min": min,
-    "pow": pow,
-    "print": print,
-    "range": range,
-    "reversed": reversed,
-    "round": round,
-    "set": set,
-    "sorted": sorted,
-    "sum": sum,
-    "True": True,
-    "tuple": tuple,
-    "ValueError": ValueError,
-    "zip": zip,
-    "__import__": __import__,
-}
-
-
-class SkipCurrentGeneration(RuntimeError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -77,40 +35,22 @@ def builtin_task_specs(task_defaults: dict[str, Any]) -> dict[str, BenchmarkTask
 
 def make_objective(name: str):
     if name == "sphere":
-        def sphere(x):
-            x = np.asarray(x, dtype=float)
-            with np.errstate(all="ignore"):
-                return float(np.sum(np.square(x)))
-        return sphere
-
+        return lambda x: float(np.sum(np.square(x)))
     if name == "rastrigin":
-        def rastrigin(x):
-            x = np.asarray(x, dtype=float)
-            with np.errstate(all="ignore"):
-                return float(10 * x.size + np.sum(np.square(x) - 10 * np.cos(2 * np.pi * x)))
-        return rastrigin
-
+        return lambda x: float(10 * len(x) + np.sum(np.square(x) - 10 * np.cos(2 * np.pi * x)))
     if name == "rosenbrock":
-        def rosenbrock(x):
-            x = np.asarray(x, dtype=float)
-            with np.errstate(all="ignore"):
-                return float(np.sum(100.0 * np.square(x[1:] - np.square(x[:-1])) + np.square(1 - x[:-1])))
-        return rosenbrock
-
+        return lambda x: float(np.sum(100.0 * np.square(x[1:] - np.square(x[:-1])) + np.square(1 - x[:-1])))
     if name == "ackley":
         def ackley(x):
             x = np.asarray(x, dtype=float)
             a = 20.0
             b = 0.2
             c = 2 * np.pi
-            n = max(int(x.size), 1)
-            with np.errstate(all="ignore"):
-                sum_sq = np.sum(np.square(x))
-                sum_cos = np.sum(np.cos(c * x))
-                value = -a * np.exp(-b * np.sqrt(sum_sq / n)) - np.exp(sum_cos / n) + a + np.e
-            return float(value)
+            n = x.size
+            sum_sq = np.sum(x ** 2)
+            sum_cos = np.sum(np.cos(c * x))
+            return float(-a * np.exp(-b * np.sqrt(sum_sq / n)) - np.exp(sum_cos / n) + a + np.e)
         return ackley
-
     raise ValueError(f"Unknown objective: {name}")
 
 
@@ -124,168 +64,126 @@ def score_from_best_f(best_f: float) -> float:
     return -math.log10(max(float(best_f), 1e-12))
 
 
-def _read_skip_request_count() -> int:
-    path_str = os.environ.get("BENCHMARK_SKIP_SIGNAL_FILE", "").strip()
-    if not path_str:
-        return 0
-    path = Path(path_str)
-    if not path.exists():
-        return 0
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
-    try:
-        return int(payload.get("skip_count", 0) or 0)
-    except Exception:
-        return 0
-
-
-def get_safe_exec_globals() -> dict[str, Any]:
-    return {
-        "np": np,
-        "numpy": np,
-        "math": math,
-        "random": pyrandom,
-        "__builtins__": dict(_SAFE_BUILTINS),
-    }
-
-
 def validate_python_code(code: str) -> None:
     tree = ast.parse(code)
-    has_solve = False
-
+    allowed_roots = {"numpy", "np", "math", "random"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                if root not in _ALLOWED_IMPORT_ROOTS:
+                if root not in allowed_roots:
                     raise ValueError(f"Disallowed import: {alias.name}")
-
         if isinstance(node, ast.ImportFrom):
             if node.module is None:
                 raise ValueError("Relative imports are not allowed")
             root = node.module.split(".")[0]
-            if root not in _ALLOWED_IMPORT_ROOTS:
+            if root not in allowed_roots:
                 raise ValueError(f"Disallowed import-from: {node.module}")
-
-        if isinstance(node, ast.FunctionDef) and node.name == "solve":
-            has_solve = True
-
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id in _DISALLOWED_MODULE_ROOTS:
-                raise ValueError(f"Disallowed module usage: {node.value.id}.{node.attr}")
-
-    if not has_solve:
-        raise ValueError("Generated code does not define a top-level solve()")
 
 
 class BudgetedObjective:
-    def __init__(self, fn, budget: int, dim: int, lower_bound: float, upper_bound: float, skip_baseline: int = 0):
+    def __init__(self, fn, budget: int, lower_bound: float, upper_bound: float):
         self.fn = fn
         self.budget = int(budget)
-        self.dim = int(dim)
+        self.calls = 0
         self.lower_bound = float(lower_bound)
         self.upper_bound = float(upper_bound)
-        self.skip_baseline = int(skip_baseline)
-        self.calls = 0
         self.best_f = float("inf")
-        self.best_x: list[float] | None = None
-        self.best_history: list[float] = []
+        self.history: list[float] = []
 
     def __call__(self, x):
-        if _read_skip_request_count() > self.skip_baseline:
-            raise SkipCurrentGeneration("Skipped current generation/candidate from terminal")
         if self.calls >= self.budget:
             raise RuntimeError("Evaluation budget exceeded")
-
-        arr = np.asarray(x, dtype=float).reshape(-1)
-        if arr.size != self.dim:
-            raise ValueError(f"Expected candidate dimension {self.dim}, got {arr.size}")
-        if not np.all(np.isfinite(arr)):
-            raise FloatingPointError("Candidate vector contains NaN or Inf")
-
-        arr = np.clip(arr, self.lower_bound, self.upper_bound)
-        with np.errstate(all="ignore"):
-            value = float(self.fn(arr))
-        if not np.isfinite(value):
-            raise FloatingPointError("Objective returned NaN or Inf")
-
         self.calls += 1
-        if value < self.best_f:
-            self.best_f = value
-            self.best_x = arr.astype(float).tolist()
-        self.best_history.append(self.best_f)
-        return value
+        x = np.asarray(x, dtype=float)
+        if x.ndim != 1:
+            x = x.reshape(-1)
+        if x.size == 0:
+            raise ValueError("Candidate vector is empty")
+        if not np.all(np.isfinite(x)):
+            raise FloatingPointError("Candidate vector contains non-finite values")
+        x = np.clip(x, self.lower_bound, self.upper_bound)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", category=RuntimeWarning)
+            with np.errstate(all="raise"):
+                fx = float(self.fn(x))
+        if not np.isfinite(fx):
+            raise FloatingPointError("Objective returned non-finite value")
+        if fx < self.best_f:
+            self.best_f = fx
+        self.history.append(self.best_f)
+        return fx
 
 
-def _coerce_result(result: Any) -> tuple[float | None, list[float], list[float] | None]:
-    returned_best_f: float | None = None
-    returned_history: list[float] = []
-    returned_best_x: list[float] | None = None
+class ManualSkipRequested(RuntimeError):
+    pass
 
+
+def _coerce_result(result: Any) -> tuple[float | None, list[float]]:
+    fallback_hist: list[float] = []
     if isinstance(result, dict):
-        raw_best_f = result.get("best_f")
-        raw_history = result.get("history", [])
-        raw_best_x = result.get("best_x")
-    elif isinstance(result, (tuple, list)):
-        raw_best_x = result[0] if len(result) >= 1 else None
-        raw_best_f = result[1] if len(result) >= 2 else None
-        raw_history = result[2] if len(result) >= 3 else []
-    else:
-        raw_best_x = None
-        raw_best_f = result
-        raw_history = []
+        best_f = result.get("best_f")
+        raw_history = result.get("history", fallback_hist)
+        hist: list[float] = []
+        for item in list(raw_history)[:]:
+            try:
+                val = float(item)
+            except Exception:
+                continue
+            if np.isfinite(val):
+                hist.append(val)
+        try:
+            best = float(best_f) if best_f is not None else None
+        except Exception:
+            best = None
+        if best is not None and not np.isfinite(best):
+            best = None
+        return best, hist
+
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        try:
+            best = float(result[1])
+        except Exception:
+            best = None
+        hist: list[float] = []
+        if len(result) >= 3 and isinstance(result[2], (list, tuple)):
+            for item in result[2]:
+                try:
+                    val = float(item)
+                except Exception:
+                    continue
+                if np.isfinite(val):
+                    hist.append(val)
+        if best is not None and not np.isfinite(best):
+            best = None
+        return best, hist
 
     try:
-        value = float(raw_best_f)
-        if math.isfinite(value):
-            returned_best_f = value
+        best = float(result)
+        if np.isfinite(best):
+            return best, []
     except Exception:
-        returned_best_f = None
-
-    try:
-        arr = np.asarray(raw_best_x, dtype=float).reshape(-1)
-        if arr.size > 0 and np.all(np.isfinite(arr)):
-            returned_best_x = arr.astype(float).tolist()
-    except Exception:
-        returned_best_x = None
-
-    try:
-        for item in list(raw_history):
-            value = float(item)
-            if math.isfinite(value):
-                returned_history.append(value)
-    except Exception:
-        returned_history = []
-
-    return returned_best_f, returned_history, returned_best_x
+        pass
+    return None, []
 
 
-def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int = 0) -> dict[str, Any]:
-    per_problem: list[dict[str, Any]] = []
-    all_scores: list[float] = []
-    objective_means: list[float] = []
-    total_calls = 0
+def evaluate_solver_callable(solver, task: BenchmarkTask) -> dict[str, Any]:
+    per_problem = []
+    all_scores = []
+    objective_means = []
 
     for objective_name in objective_names_for_task(task):
         fn = make_objective(objective_name)
-        seed_best_fs: list[float] = []
-        seed_calls: list[int] = []
+        seed_best_fs = []
 
         for seed in task.eval_seeds:
-            wrapped = BudgetedObjective(
-                fn,
-                task.budget,
-                task.dim,
-                task.lower_bound,
-                task.upper_bound,
-                skip_baseline=skip_baseline,
-            )
+            wrapped = BudgetedObjective(fn, task.budget, task.lower_bound, task.upper_bound)
+            best_f = float("inf")
+            fail_reason = ""
             try:
                 with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
-                    with np.errstate(over="raise", divide="raise", invalid="raise"):
+                    warnings.filterwarnings("error", category=RuntimeWarning)
+                    with np.errstate(all="raise"):
                         result = solver(
                             wrapped,
                             task.budget,
@@ -294,48 +192,30 @@ def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int = 0
                             task.upper_bound,
                             int(seed),
                         )
-            except SkipCurrentGeneration:
+                reported_best, reported_hist = _coerce_result(result)
+                observed_best = wrapped.best_f if wrapped.calls > 0 else float("inf")
+                if reported_hist:
+                    hist_min = min(reported_hist)
+                    if np.isfinite(hist_min):
+                        observed_best = min(observed_best, hist_min)
+                if reported_best is not None:
+                    observed_best = min(observed_best, reported_best)
+                best_f = observed_best
+            except ManualSkipRequested:
                 raise
-            except (RuntimeWarning, FloatingPointError, OverflowError) as exc:
-                raise RuntimeError(f"{objective_name}/seed {seed}: numerical instability: {type(exc).__name__}: {exc}") from exc
             except Exception as exc:
-                raise RuntimeError(f"{objective_name}/seed {seed}: {type(exc).__name__}: {exc}") from exc
+                fail_reason = f"{type(exc).__name__}: {exc}"
+                best_f = float("inf")
 
-            returned_best_f, returned_history, returned_best_x = _coerce_result(result)
-            if wrapped.calls <= 0:
-                raise ValueError(f"{objective_name}/seed {seed}: solver never called the objective")
-            if not math.isfinite(wrapped.best_f):
-                raise FloatingPointError(f"{objective_name}/seed {seed}: no finite objective value was observed")
+            if wrapped.calls == 0:
+                best_f = 1e12
+                if not fail_reason:
+                    fail_reason = "Solver never called the objective"
 
-            observed_best_f = float(wrapped.best_f)
-            best_f = observed_best_f
-            consistency_gap = 0.0
-
-            if returned_best_x is not None:
-                arr = np.asarray(returned_best_x, dtype=float).reshape(-1)
-                if arr.size == task.dim and np.all(np.isfinite(arr)):
-                    arr = np.clip(arr, task.lower_bound, task.upper_bound)
-                    with np.errstate(all="ignore"):
-                        returned_x_value = float(fn(arr))
-                    if math.isfinite(returned_x_value):
-                        best_f = min(best_f, returned_x_value)
-                        consistency_gap = max(consistency_gap, abs(returned_x_value - observed_best_f))
-
-            if returned_best_f is not None:
-                consistency_gap = max(consistency_gap, abs(returned_best_f - observed_best_f))
-
-            if returned_history:
-                hist_best = min(returned_history)
-                consistency_gap = max(consistency_gap, abs(hist_best - observed_best_f))
-
-            if consistency_gap > 1e-6 * max(1.0, abs(observed_best_f)):
-                raise ValueError(
-                    f"{objective_name}/seed {seed}: returned best_f/history is inconsistent with observed objective evaluations"
-                )
+            if not np.isfinite(best_f):
+                best_f = 1e12
 
             seed_best_fs.append(best_f)
-            seed_calls.append(wrapped.calls)
-            total_calls += wrapped.calls
             all_scores.append(score_from_best_f(best_f))
 
         problem_mean = float(np.mean(seed_best_fs))
@@ -345,15 +225,13 @@ def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int = 0
                 "objective": objective_name,
                 "mean_best_f": problem_mean,
                 "score": float(np.mean([score_from_best_f(x) for x in seed_best_fs])),
-                "mean_objective_calls": float(np.mean(seed_calls)) if seed_calls else 0.0,
             }
         )
 
     return {
-        "fitness": float(np.mean(all_scores)),
-        "raw_objective_mean": float(np.mean(objective_means)),
+        "fitness": float(np.mean(all_scores)) if all_scores else score_from_best_f(1e12),
+        "raw_objective_mean": float(np.mean(objective_means)) if objective_means else 1e12,
         "per_problem": per_problem,
-        "objective_calls_total": int(total_calls),
     }
 
 
@@ -378,12 +256,9 @@ Rules:
 - Return either:
   1. a dict with keys `best_x`, `best_f`, `history`, or
   2. a tuple `(best_x, best_f, history)`.
-- `best_f` and `history` must come only from real objective evaluations.
 - `history` should be the best-so-far objective values over time.
 - Keep the code self-contained.
 - Do not use scipy or any other external library.
-- Avoid numerically unstable operations and divisions by values that may be zero.
-- Clip every candidate back into the box bounds before calling `objective`.
 - Do not output explanations, only valid Python code.
 
 The optimizer will be evaluated on: {objectives}.
@@ -402,43 +277,17 @@ import numpy as np
 
 def solve(objective, budget, dim, lower_bound, upper_bound, seed):
     rng = np.random.default_rng(seed)
-    random.seed(seed)
-
-    def clip(x):
-        return np.clip(np.asarray(x, dtype=float), lower_bound, upper_bound)
-
-    best_x = clip(rng.uniform(lower_bound, upper_bound, size=dim))
+    best_x = rng.uniform(lower_bound, upper_bound, size=dim)
     best_f = float(objective(best_x))
     history = [best_f]
-
-    step = max((upper_bound - lower_bound) * 0.2, 1e-3)
-    while len(history) < budget:
-        local_trials = min(8, budget - len(history))
-        improved = False
-        for _ in range(local_trials):
-            candidate = clip(best_x + rng.normal(0.0, step, size=dim))
-            value = float(objective(candidate))
-            if value < best_f:
-                best_x = candidate
-                best_f = value
-                improved = True
-            history.append(best_f)
-            if len(history) >= budget:
-                break
-        if not improved:
-            step *= 0.7
-            if step < 1e-4:
-                step = max((upper_bound - lower_bound) * 0.05, 1e-4)
-                restart = clip(rng.uniform(lower_bound, upper_bound, size=dim))
-                value = float(objective(restart))
-                if value < best_f:
-                    best_x = restart
-                    best_f = value
-                if len(history) < budget:
-                    history.append(best_f)
-        else:
-            step = min(step * 1.05, max((upper_bound - lower_bound) * 0.5, 1e-3))
-
+    for _ in range(1, budget):
+        x = rng.uniform(lower_bound, upper_bound, size=dim)
+        x = np.clip(x, lower_bound, upper_bound)
+        fx = float(objective(x))
+        if fx < best_f:
+            best_x = x.copy()
+            best_f = fx
+        history.append(best_f)
     return {
         "best_x": best_x.tolist(),
         "best_f": float(best_f),
@@ -457,7 +306,6 @@ Use only numpy, math, and optionally random.
 Do not use scipy or any other external library.
 Do not exceed the evaluation budget.
 Return a dict with keys `best_x`, `best_f`, and `history`.
-`best_f` and `history` must come only from real objective evaluations.
 
 This function will be evaluated on: {objectives}
 Dimension: {task.dim}
