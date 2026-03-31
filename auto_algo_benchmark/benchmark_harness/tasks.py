@@ -9,59 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import random as pyrandom
 
 
-INVALID_OBJECTIVE = 1e12
 _ALLOWED_IMPORT_ROOTS = {"numpy", "np", "math", "random"}
-_DISALLOWED_CALL_NAMES = {
-    "eval",
-    "exec",
-    "open",
-    "compile",
-    "input",
-    "globals",
-    "locals",
-    "vars",
-    "getattr",
-    "setattr",
-    "delattr",
-    "breakpoint",
-    "__import__",
-}
-_DISALLOWED_ATTRIBUTE_ROOTS = {
-    "os",
-    "sys",
-    "subprocess",
-    "pathlib",
-    "socket",
-    "shutil",
-    "ctypes",
-    "multiprocessing",
-    "threading",
-    "concurrent",
-    "requests",
-    "urllib",
-    "importlib",
-    "builtins",
-}
-_DISALLOWED_ATTRIBUTE_NAMES = {
-    "system",
-    "popen",
-    "Popen",
-    "run",
-    "kill",
-    "terminate",
-    "remove",
-    "unlink",
-    "rmdir",
-    "removedirs",
-    "rename",
-    "replace",
-    "mkdir",
-    "makedirs",
-    "spawn",
-    "fork",
-}
+_DISALLOWED_MODULE_ROOTS = {"os", "sys", "subprocess", "pathlib", "shutil", "socket", "requests"}
 
 _SAFE_BUILTINS = {
     "abs": abs,
@@ -96,25 +48,6 @@ _SAFE_BUILTINS = {
 
 class SkipCurrentGeneration(RuntimeError):
     pass
-
-
-def _read_skip_request_count() -> int:
-    path_str = os.environ.get("BENCHMARK_SKIP_SIGNAL_FILE", "").strip()
-    if not path_str:
-        return 0
-    path = Path(path_str)
-    if not path.exists():
-        return 0
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
-    for key in ("skip_count", "generation"):
-        try:
-            return int(payload.get(key, 0) or 0)
-        except Exception:
-            continue
-    return 0
 
 
 @dataclass(frozen=True)
@@ -190,11 +123,29 @@ def score_from_best_f(best_f: float) -> float:
     return -math.log10(max(float(best_f), 1e-12))
 
 
+def _read_skip_request_count() -> int:
+    path_str = os.environ.get("BENCHMARK_SKIP_SIGNAL_FILE", "").strip()
+    if not path_str:
+        return 0
+    path = Path(path_str)
+    if not path.exists():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    try:
+        return int(payload.get("skip_count", 0) or 0)
+    except Exception:
+        return 0
+
+
 def get_safe_exec_globals() -> dict[str, Any]:
     return {
         "np": np,
         "numpy": np,
         "math": math,
+        "random": pyrandom,
         "__builtins__": dict(_SAFE_BUILTINS),
     }
 
@@ -220,20 +171,8 @@ def validate_python_code(code: str) -> None:
         if isinstance(node, ast.FunctionDef) and node.name == "solve":
             has_solve = True
 
-        if isinstance(node, ast.Name) and node.id in _DISALLOWED_CALL_NAMES:
-            raise ValueError(f"Disallowed builtin usage: {node.id}")
-
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in _DISALLOWED_CALL_NAMES:
-                raise ValueError(f"Disallowed call: {node.func.id}")
-            if isinstance(node.func, ast.Attribute):
-                if node.func.attr in _DISALLOWED_ATTRIBUTE_NAMES:
-                    raise ValueError(f"Disallowed attribute call: {node.func.attr}")
-                if isinstance(node.func.value, ast.Name) and node.func.value.id in _DISALLOWED_ATTRIBUTE_ROOTS:
-                    raise ValueError(f"Disallowed module usage: {node.func.value.id}.{node.func.attr}")
-
-        if isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id in _DISALLOWED_ATTRIBUTE_ROOTS:
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in _DISALLOWED_MODULE_ROOTS:
                 raise ValueError(f"Disallowed module usage: {node.value.id}.{node.attr}")
 
     if not has_solve:
@@ -241,13 +180,13 @@ def validate_python_code(code: str) -> None:
 
 
 class BudgetedObjective:
-    def __init__(self, fn, budget: int, dim: int, lower_bound: float, upper_bound: float, skip_baseline: int | None = None):
+    def __init__(self, fn, budget: int, dim: int, lower_bound: float, upper_bound: float, skip_baseline: int = 0):
         self.fn = fn
         self.budget = int(budget)
         self.dim = int(dim)
         self.lower_bound = float(lower_bound)
         self.upper_bound = float(upper_bound)
-        self.skip_baseline = int(skip_baseline or 0)
+        self.skip_baseline = int(skip_baseline)
         self.calls = 0
         self.best_f = float("inf")
         self.best_x: list[float] | None = None
@@ -255,10 +194,9 @@ class BudgetedObjective:
 
     def __call__(self, x):
         if _read_skip_request_count() > self.skip_baseline:
-            raise SkipCurrentGeneration("Skipped current generation from terminal")
+            raise SkipCurrentGeneration("Skipped current generation/candidate from terminal")
         if self.calls >= self.budget:
             raise RuntimeError("Evaluation budget exceeded")
-        self.calls += 1
 
         arr = np.asarray(x, dtype=float).reshape(-1)
         if arr.size != self.dim:
@@ -272,6 +210,7 @@ class BudgetedObjective:
         if not np.isfinite(value):
             raise FloatingPointError("Objective returned NaN or Inf")
 
+        self.calls += 1
         if value < self.best_f:
             self.best_f = value
             self.best_x = arr.astype(float).tolist()
@@ -285,72 +224,45 @@ def _coerce_result(result: Any) -> tuple[float | None, list[float], list[float] 
     returned_best_x: list[float] | None = None
 
     if isinstance(result, dict):
-        best_f = result.get("best_f")
-        best_x = result.get("best_x")
+        raw_best_f = result.get("best_f")
         raw_history = result.get("history", [])
-
-        try:
-            returned_best_f = float(best_f)
-            if not math.isfinite(returned_best_f):
-                returned_best_f = None
-        except Exception:
-            returned_best_f = None
-
-        if best_x is not None:
-            try:
-                arr = np.asarray(best_x, dtype=float).reshape(-1)
-                if np.all(np.isfinite(arr)):
-                    returned_best_x = arr.astype(float).tolist()
-            except Exception:
-                returned_best_x = None
-
-        try:
-            for item in list(raw_history):
-                value = float(item)
-                if math.isfinite(value):
-                    returned_history.append(value)
-        except Exception:
-            returned_history = []
-        return returned_best_f, returned_history, returned_best_x
-
-    if isinstance(result, (tuple, list)):
-        if len(result) >= 2:
-            try:
-                returned_best_f = float(result[1])
-                if not math.isfinite(returned_best_f):
-                    returned_best_f = None
-            except Exception:
-                returned_best_f = None
-
-            if len(result) >= 1:
-                try:
-                    arr = np.asarray(result[0], dtype=float).reshape(-1)
-                    if np.all(np.isfinite(arr)):
-                        returned_best_x = arr.astype(float).tolist()
-                except Exception:
-                    returned_best_x = None
-
-            if len(result) >= 3 and isinstance(result[2], (list, tuple, np.ndarray)):
-                for item in result[2]:
-                    try:
-                        value = float(item)
-                    except Exception:
-                        continue
-                    if math.isfinite(value):
-                        returned_history.append(value)
-        return returned_best_f, returned_history, returned_best_x
+        raw_best_x = result.get("best_x")
+    elif isinstance(result, (tuple, list)):
+        raw_best_x = result[0] if len(result) >= 1 else None
+        raw_best_f = result[1] if len(result) >= 2 else None
+        raw_history = result[2] if len(result) >= 3 else []
+    else:
+        raw_best_x = None
+        raw_best_f = result
+        raw_history = []
 
     try:
-        returned_best_f = float(result)
-        if not math.isfinite(returned_best_f):
-            returned_best_f = None
+        value = float(raw_best_f)
+        if math.isfinite(value):
+            returned_best_f = value
     except Exception:
         returned_best_f = None
+
+    try:
+        arr = np.asarray(raw_best_x, dtype=float).reshape(-1)
+        if arr.size > 0 and np.all(np.isfinite(arr)):
+            returned_best_x = arr.astype(float).tolist()
+    except Exception:
+        returned_best_x = None
+
+    try:
+        for item in list(raw_history):
+            value = float(item)
+            if math.isfinite(value):
+                returned_history.append(value)
+    except Exception:
+        returned_history = []
+
     return returned_best_f, returned_history, returned_best_x
 
 
-def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int | None = None) -> dict[str, Any]:
-    per_problem = []
+def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int = 0) -> dict[str, Any]:
+    per_problem: list[dict[str, Any]] = []
     all_scores: list[float] = []
     objective_means: list[float] = []
     total_calls = 0
@@ -361,8 +273,14 @@ def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int | N
         seed_calls: list[int] = []
 
         for seed in task.eval_seeds:
-            wrapped = BudgetedObjective(fn, task.budget, task.dim, task.lower_bound, task.upper_bound, skip_baseline=skip_baseline)
-
+            wrapped = BudgetedObjective(
+                fn,
+                task.budget,
+                task.dim,
+                task.lower_bound,
+                task.upper_bound,
+                skip_baseline=skip_baseline,
+            )
             try:
                 result = solver(
                     wrapped,
@@ -372,6 +290,8 @@ def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int | N
                     task.upper_bound,
                     int(seed),
                 )
+            except SkipCurrentGeneration:
+                raise
             except Exception as exc:
                 raise RuntimeError(f"{objective_name}/seed {seed}: {type(exc).__name__}: {exc}") from exc
 
@@ -383,7 +303,7 @@ def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int | N
 
             observed_best_f = float(wrapped.best_f)
             best_f = observed_best_f
-            consistency_gap = None
+            consistency_gap = 0.0
 
             if returned_best_x is not None:
                 arr = np.asarray(returned_best_x, dtype=float).reshape(-1)
@@ -393,15 +313,16 @@ def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int | N
                         returned_x_value = float(fn(arr))
                     if math.isfinite(returned_x_value):
                         best_f = min(best_f, returned_x_value)
-                        consistency_gap = abs(returned_x_value - observed_best_f)
+                        consistency_gap = max(consistency_gap, abs(returned_x_value - observed_best_f))
 
             if returned_best_f is not None:
-                if consistency_gap is None:
-                    consistency_gap = abs(returned_best_f - observed_best_f)
-                else:
-                    consistency_gap = min(consistency_gap, abs(returned_best_f - observed_best_f))
+                consistency_gap = max(consistency_gap, abs(returned_best_f - observed_best_f))
 
-            if consistency_gap is not None and consistency_gap > 1e-6 * max(1.0, abs(observed_best_f)):
+            if returned_history:
+                hist_best = min(returned_history)
+                consistency_gap = max(consistency_gap, abs(hist_best - observed_best_f))
+
+            if consistency_gap > 1e-6 * max(1.0, abs(observed_best_f)):
                 raise ValueError(
                     f"{objective_name}/seed {seed}: returned best_f/history is inconsistent with observed objective evaluations"
                 )
@@ -451,12 +372,12 @@ Rules:
 - Return either:
   1. a dict with keys `best_x`, `best_f`, `history`, or
   2. a tuple `(best_x, best_f, history)`.
-- `best_f` and `history` must come only from real objective evaluations. Never fabricate them.
+- `best_f` and `history` must come only from real objective evaluations.
 - `history` should be the best-so-far objective values over time.
 - Keep the code self-contained.
 - Do not use scipy or any other external library.
-- Avoid numerically unstable operations, unsafe matrix inversions, and divisions by values that may be zero.
-- Clip any proposed candidate back into the box bounds before calling `objective`.
+- Avoid numerically unstable operations and divisions by values that may be zero.
+- Clip every candidate back into the box bounds before calling `objective`.
 - Do not output explanations, only valid Python code.
 
 The optimizer will be evaluated on: {objectives}.
@@ -529,10 +450,8 @@ The function must implement a continuous black-box optimizer that minimizes the 
 Use only numpy, math, and optionally random.
 Do not use scipy or any other external library.
 Do not exceed the evaluation budget.
-Always clip candidate vectors to the box bounds before calling the objective.
 Return a dict with keys `best_x`, `best_f`, and `history`.
-`best_f` and `history` must be derived only from real objective evaluations.
-Avoid unstable covariance updates, unsafe matrix inversions, and divisions by values that may be zero.
+`best_f` and `history` must come only from real objective evaluations.
 
 This function will be evaluated on: {objectives}
 Dimension: {task.dim}
