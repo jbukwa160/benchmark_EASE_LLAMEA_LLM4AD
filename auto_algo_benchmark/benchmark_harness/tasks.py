@@ -4,6 +4,7 @@ import ast
 import json
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -282,16 +283,21 @@ def evaluate_solver_callable(solver, task: BenchmarkTask, skip_baseline: int = 0
                 skip_baseline=skip_baseline,
             )
             try:
-                result = solver(
-                    wrapped,
-                    task.budget,
-                    task.dim,
-                    task.lower_bound,
-                    task.upper_bound,
-                    int(seed),
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", RuntimeWarning)
+                    with np.errstate(over="raise", divide="raise", invalid="raise"):
+                        result = solver(
+                            wrapped,
+                            task.budget,
+                            task.dim,
+                            task.lower_bound,
+                            task.upper_bound,
+                            int(seed),
+                        )
             except SkipCurrentGeneration:
                 raise
+            except (RuntimeWarning, FloatingPointError, OverflowError) as exc:
+                raise RuntimeError(f"{objective_name}/seed {seed}: numerical instability: {type(exc).__name__}: {exc}") from exc
             except Exception as exc:
                 raise RuntimeError(f"{objective_name}/seed {seed}: {type(exc).__name__}: {exc}") from exc
 
