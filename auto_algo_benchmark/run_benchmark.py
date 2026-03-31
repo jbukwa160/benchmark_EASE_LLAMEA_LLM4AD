@@ -13,10 +13,10 @@ from benchmark_harness.cli import run_cli
 from benchmark_harness.config import load_config
 
 
-def _write_skip_generation(path: Path, generation: int) -> None:
+def _write_skip_generation(path: Path, skip_count: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"generation": int(generation), "updated_at": time.time()}, indent=2),
+        json.dumps({"skip_count": int(skip_count), "generation": int(skip_count), "updated_at": time.time()}, indent=2),
         encoding="utf-8",
     )
 
@@ -28,10 +28,10 @@ def _start_skip_key_listener(skip_signal_path: Path):
 
     stop_event = threading.Event()
 
-    def notify_skip(generation: int) -> None:
-        _write_skip_generation(skip_signal_path, generation)
-        print(f"\nSkip requested for the current running task (generation {generation}).")
-        print("The benchmark will stop the active task at the next safe checkpoint and then continue.")
+    def notify_skip(skip_count: int) -> None:
+        _write_skip_generation(skip_signal_path, skip_count)
+        print(f"\nSkip requested for the current generation/candidate (request {skip_count}).")
+        print("The benchmark will penalize the active generation at the next safe checkpoint and then continue.")
 
     def windows_listener() -> None:
         import msvcrt
@@ -80,7 +80,7 @@ def _start_skip_key_listener(skip_signal_path: Path):
         stop_event.set()
         listener.join(timeout=1.0)
 
-    print("Press 'S' in the terminal to skip the current running task.")
+    print("Press 'S' in the terminal to skip the current generation/candidate.")
     return stop_listener
 
 
