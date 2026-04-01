@@ -1,114 +1,163 @@
-# Auto Algorithm Benchmark Harness
+# LLM Evolutionary Benchmark Harness
 
-This harness benchmarks three automatic algorithm-design systems on a shared result format:
+A clean, config-driven harness for benchmarking **LLaMEA**, **LLM4AD**, and **frontEASE**
+against continuous black-box optimisation tasks (Sphere, Rastrigin, Rosenbrock in 5D).
+All frameworks are driven by the same Ollama LLM (configured in `benchmark_config.json`).
 
-- **LLaMEA**
-- **LLM4AD** (default method: **EoH**)
-- **EASE / frontEASE** through the running HTTP API
+---
 
-It is built to work with a local **Ollama** server for LLaMEA and LLM4AD, and with an already-running **frontEASE/EASE** stack for the EASE adapter.
+## Project layout
 
-## What it does
-
-For every `(framework, benchmark task, seed)` combination it:
-
-1. runs one framework search
-2. records runtime and peak RSS memory
-3. saves a standardized `summary.csv`
-4. saves a standardized `progress.csv`
-5. generates aggregate tables and plots with `analyze_benchmark.py`
-
-## Shared output schema
-
-### `summary.csv`
-
-- `framework`
-- `benchmark`
-- `seed`
-- `status`
-- `best_search_score`
-- `raw_objective_mean`
-- `runtime_sec`
-- `peak_rss_mb`
-- `candidates_evaluated`
-- `artifact_dir`
-- `notes`
-
-### `progress.csv`
-
-- `framework`
-- `benchmark`
-- `seed`
-- `sample_index`
-- `elapsed_sec`
-- `candidate_score`
-- `best_so_far`
-
-## Benchmarks included
-
-The harness ships with a lightweight continuous black-box optimization benchmark where the searched program must implement:
-
-```python
-def solve(objective, budget, dim, lower_bound, upper_bound, seed):
-    ...
-    return {
-        "best_x": ...,
-        "best_f": ...,
-        "history": ...
-    }
+```
+auto_algo_benchmark/
+├── benchmark_config.json          ← your config file
+├── run_benchmark.py               ← main runner
+├── analyze_benchmark.py           ← result analysis & plots
+├── smoke_test.py                  ← pre-flight checks
+├── requirements.txt
+└── benchmark_harness/
+    ├── __init__.py
+    ├── config.py                  ← config loader
+    ├── tasks.py                   ← task definitions
+    ├── utils.py                   ← logging, result store, stats
+    └── adapters/
+        ├── __init__.py
+        ├── base.py                ← abstract adapter
+        ├── llamea_adapter.py      ← LLaMEA adapter
+        ├── llm4ad_adapter.py      ← LLM4AD adapter
+        └── ease_adapter.py        ← frontEASE REST adapter
 ```
 
-Included objective presets:
+---
 
-- `sphere_5d`
-- `rastrigin_5d`
-- `rosenbrock_5d`
-- `mixed_5d`
+## Quick start
 
-## Configuration
-
-Copy `benchmark_config.example.json` and edit it.
-
-Important settings:
-
-- `frameworks.llamea.repo_path`
-- `frameworks.llm4ad.repo_path`
-- `frameworks.ease.api_base_url`
-- `frameworks.ease.template_task_id`
-- `ollama.model`
-
-## Running
+### 1. Install harness dependencies
 
 ```bash
-python run_benchmark.py --config benchmark_config.json
-python analyze_benchmark.py --results-dir benchmark_results
+pip install -r requirements.txt
 ```
 
-## EASE / frontEASE notes
+### 2. Install framework repos
 
-The uploaded `frontEASE-main` repo is only the UI/server shell. The optimization core lives in the missing `src/FoP_IMT.Core` submodule, so this harness talks to your **running** server over HTTP instead of importing backend Python code.
+```bash
+# LLaMEA
+cd ../LLaMEA && pip install -e .   # or: pip install llamea
 
-The EASE adapter therefore expects:
+# LLM4AD
+cd ../LLM4AD && pip install -e .
+```
 
-- the API to be reachable
-- valid login credentials
-- an existing **template task** that you can clone for each benchmark run
+### 3. Run smoke test (verify everything is wired up)
 
-That avoids guessing the full task-config JSON schema from the frontend alone.
+```bash
+python smoke_test.py
+```
 
-## Assumptions
+Fix any ❌ errors before proceeding.
 
-- LLaMEA and LLM4AD are already installable in your environment or accessible through the provided repo paths.
-- Ollama is running locally or reachable at the configured URL.
-- EASE/frontEASE is already running and can execute cloned tasks.
+### 4. Run the benchmark
 
-## Recommended first run
+```bash
+python run_benchmark.py
+```
 
-Start with:
+Or with overrides:
 
-- one small model
-- one benchmark task
-- `seeds = [0]`
-- low search budgets
+```bash
+# Only LLaMEA, only sphere, only 2 seeds
+python run_benchmark.py --frameworks llamea --tasks sphere_5d --seeds 0 1
 
-Then scale up after you confirm all three adapters work end-to-end.
+# Dry run (validate only, no experiments)
+python run_benchmark.py --dry-run
+
+# Verbose output
+python run_benchmark.py --verbose
+```
+
+### 5. Analyse results
+
+```bash
+python analyze_benchmark.py
+python analyze_benchmark.py --plot              # saves PNG charts
+python analyze_benchmark.py --export summary.csv
+```
+
+---
+
+## benchmark_config.json reference
+
+| Key | Description |
+|---|---|
+| `output_dir` | Where to write `.jsonl` result files |
+| `append_results` | If `false`, each run overwrites previous results for the same (framework, task) |
+| `seeds` | List of random seeds |
+| `tasks` | Task names: `sphere_5d`, `rastrigin_5d`, `rosenbrock_5d` |
+| `ollama.model` | Ollama model name (e.g. `llama3.1:latest`) |
+| `ollama.base_url` | Ollama server URL (e.g. `http://10.5.32.17:11434`) |
+| `task_defaults.budget` | Max function evaluations per algorithm evaluation |
+| `task_defaults.lower_bound` / `upper_bound` | Search space bounds |
+| `task_defaults.eval_seeds` | Seeds used when evaluating a generated algorithm |
+| `frameworks.llamea.enabled` | Toggle LLaMEA on/off |
+| `frameworks.llamea.repo_path` | Path to cloned LLaMEA repo |
+| `frameworks.llamea.search_budget` | Number of LLM queries LLaMEA is allowed |
+| `frameworks.llm4ad.enabled` | Toggle LLM4AD on/off |
+| `frameworks.llm4ad.repo_path` | Path to cloned LLM4AD repo |
+| `frameworks.ease.enabled` | Toggle frontEASE on/off |
+| `frameworks.ease.api_base_url` | frontEASE server URL |
+| `frameworks.ease.template_task_id` | ID of EASE task to clone per run |
+
+---
+
+## Results format
+
+Each `.jsonl` file in `benchmark_results/` contains one JSON record per run:
+
+```json
+{
+  "framework": "llamea",
+  "task": "sphere_5d",
+  "seed": 0,
+  "best_value": 0.00123,
+  "success": true,
+  "error": null,
+  "elapsed_sec": 142.5,
+  "timestamp": "2025-04-01T10:00:00Z",
+  "extra": { ... }
+}
+```
+
+`best_value` is the **raw objective value** (lower = better for all tasks).
+
+---
+
+## How each adapter works
+
+### LLaMEA (`llamea_adapter.py`)
+Calls `LLaMEA(...).run(evaluate_fn)` with the Ollama server exposed as an
+OpenAI-compatible endpoint (`<base_url>/v1`).  The evaluation function execs
+generated algorithm code and runs it on the task over `eval_seeds`, returning
+the mean objective value.
+
+### LLM4AD (`llm4ad_adapter.py`)
+Wraps the task as a `_ContinuousEvaluation` object (compatible with LLM4AD's
+`Evaluation` interface) and calls `EoH(...).run()`.  Connects to Ollama via
+`HttpsApi` pointing at `<base_url>`.
+
+### frontEASE (`ease_adapter.py`)
+Communicates via REST API: authenticates, clones a template task, uploads the
+problem definition, starts the run, polls until completion, and retrieves the
+best result.  Set `ease.template_task_id` in config before using.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `llamea` import error | `pip install llamea` or check `llamea.repo_path` |
+| `llm4ad` import error | `cd ../LLM4AD && pip install -e .` |
+| Ollama connection refused | Check `ollama.base_url`; ensure `ollama serve` is running |
+| Model not found | `ollama pull llama3.1:latest` |
+| EASE login fails | Check `username`, `password`, and `api_base_url` in config |
+| All runs fail with timeout | Reduce `search_budget` / `max_sample_nums` |
