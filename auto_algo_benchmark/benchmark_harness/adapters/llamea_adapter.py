@@ -224,21 +224,19 @@ class _LLaMEAEvaluator:
 
 
 
-def _safe_pickle_archive_method(self, *args, **kwargs):
-    """
-    Class-level wrapper for LLaMEA.pickle_archive that converts pickling
-    failures into non-fatal warnings without making the optimizer instance
-    itself unpicklable.
-    """
-    optimizer_cls = self.__class__
-    original = getattr(optimizer_cls, "_auto_algo_original_pickle_archive", None)
-    if original is None:
-        return None
-    try:
-        return original(self, *args, **kwargs)
-    except (pickle.PicklingError, TypeError, AttributeError) as exc:
-        logger.debug("LLaMEA pickle_archive skipped (not fatal): %s", exc)
-        return None
+def _disabled_pickle_archive(self, *args, **kwargs):
+    """Disable LLaMEA warm-start archive snapshots during benchmark runs."""
+    return None
+
+
+def _stable_create_log_dir_method(self, name=""):
+    """Create one stable log directory per task/seed instead of exp-* folders."""
+    log_dir = Path(getattr(self.__class__, "_auto_algo_log_dir"))
+    if log_dir.exists():
+        shutil.rmtree(log_dir, ignore_errors=True)
+    (log_dir / "configspace").mkdir(parents=True, exist_ok=True)
+    (log_dir / "code").mkdir(parents=True, exist_ok=True)
+    return str(log_dir)
 
 
 class LLaMEAAdapter(BaseAdapter):
@@ -283,32 +281,24 @@ class LLaMEAAdapter(BaseAdapter):
     def _patch_experiment_logger(log_dir: Path):
         import llamea.loggers as llamea_loggers  # type: ignore
 
-        original_create_log_dir = llamea_loggers.ExperimentLogger.create_log_dir
-
-        def stable_create_log_dir(self, name=""):
-            if log_dir.exists():
-                shutil.rmtree(log_dir, ignore_errors=True)
-            (log_dir / "configspace").mkdir(parents=True, exist_ok=True)
-            (log_dir / "code").mkdir(parents=True, exist_ok=True)
-            return str(log_dir)
-
-        llamea_loggers.ExperimentLogger.create_log_dir = stable_create_log_dir
-        return llamea_loggers.ExperimentLogger, original_create_log_dir
+        logger_cls = llamea_loggers.ExperimentLogger
+        original_create_log_dir = logger_cls.create_log_dir
+        logger_cls._auto_algo_log_dir = str(log_dir)
+        logger_cls.create_log_dir = _stable_create_log_dir_method
+        return logger_cls, original_create_log_dir
 
     @staticmethod
-    def _patch_pickle_archive(optimizer):
+    def _patch_pickle_archive(llamea_cls):
         """
-        Patch LLaMEA's pickle_archive at the *class* level so the optimizer
-        instance itself does not hold a local function in its __dict__.
-        Returns the original method so callers can restore it afterwards.
+        Disable LLaMEA archive pickling for the whole class before constructing
+        the optimizer. LLaMEA calls self.pickle_archive() inside __init__, so
+        patching after instantiation is too late.
         """
-        optimizer_cls = optimizer.__class__
-        original = getattr(optimizer_cls, "pickle_archive", None)
+        original = getattr(llamea_cls, "pickle_archive", None)
         if original is None:
             return None
-
-        setattr(optimizer_cls, "pickle_archive", _safe_pickle_archive_method)
-        return optimizer_cls, original
+        setattr(llamea_cls, "pickle_archive", _disabled_pickle_archive)
+        return llamea_cls, original
 
     def run(self, task: BenchmarkTask, seed: int) -> dict[str, Any]:
         self._add_repo_to_path()
@@ -401,15 +391,14 @@ class LLaMEAAdapter(BaseAdapter):
                 tournament_size  = int(cfg.get("tournament_size", 3)),
             )
             filtered  = {k: v for k, v in want.items() if k in ctor_params}
-            optimizer = LLaMEA(**filtered)
-
-            pickle_patch = self._patch_pickle_archive(optimizer)
+            pickle_patch = self._patch_pickle_archive(LLaMEA)
             if pickle_patch is not None:
                 optimizer_cls, original_pickle_archive = pickle_patch
-                setattr(optimizer_cls, "_auto_algo_original_pickle_archive", original_pickle_archive)
             else:
                 optimizer_cls = None
                 original_pickle_archive = None
+
+            optimizer = LLaMEA(**filtered)
 
             if logger_patch is not None:
                 _, original_create_log_dir = logger_patch
@@ -418,18 +407,16 @@ class LLaMEAAdapter(BaseAdapter):
                 finally:
                     import llamea.loggers as llamea_loggers  # type: ignore
                     llamea_loggers.ExperimentLogger.create_log_dir = original_create_log_dir
+                    if hasattr(llamea_loggers.ExperimentLogger, "_auto_algo_log_dir"):
+                        delattr(llamea_loggers.ExperimentLogger, "_auto_algo_log_dir")
                     if optimizer_cls is not None and original_pickle_archive is not None:
                         setattr(optimizer_cls, "pickle_archive", original_pickle_archive)
-                        if hasattr(optimizer_cls, "_auto_algo_original_pickle_archive"):
-                            delattr(optimizer_cls, "_auto_algo_original_pickle_archive")
             else:
                 try:
                     best_solution = optimizer.run()
                 finally:
                     if optimizer_cls is not None and original_pickle_archive is not None:
                         setattr(optimizer_cls, "pickle_archive", original_pickle_archive)
-                        if hasattr(optimizer_cls, "_auto_algo_original_pickle_archive"):
-                            delattr(optimizer_cls, "_auto_algo_original_pickle_archive")
 
             if best_solution is None:
                 raise RuntimeError("LLaMEA.run() returned None.")
