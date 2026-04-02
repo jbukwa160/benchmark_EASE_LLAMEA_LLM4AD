@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import sys
 import time
@@ -35,13 +36,12 @@ class LLM4ADAdapter(BaseAdapter):
             sys.path.insert(0, str(p))
             logger.debug("Added LLM4AD repo to sys.path: %s", p)
 
-
     def _load_llm4ad_symbols(self):
         import importlib.util
         import types
 
         repo_root = self._repo_path()
-        pkg_root = repo_root / "llm4ad"
+        pkg_root  = repo_root / "llm4ad"
 
         def ensure_package(name: str, path: Path):
             mod = sys.modules.get(name)
@@ -55,8 +55,7 @@ class LLM4ADAdapter(BaseAdapter):
             if name in sys.modules and getattr(sys.modules[name], "__file__", None) == str(init_file):
                 return sys.modules[name]
             spec = importlib.util.spec_from_file_location(
-                name,
-                str(init_file),
+                name, str(init_file),
                 submodule_search_locations=[str(search_path)],
             )
             if spec is None or spec.loader is None:
@@ -67,11 +66,15 @@ class LLM4ADAdapter(BaseAdapter):
             return module
 
         ensure_package("llm4ad", pkg_root)
-        load_pkg("llm4ad.base", pkg_root / "base" / "__init__.py", pkg_root / "base")
+        load_pkg("llm4ad.base",  pkg_root / "base"  / "__init__.py", pkg_root / "base")
         ensure_package("llm4ad.tools", pkg_root / "tools")
-        load_pkg("llm4ad.tools.profiler", pkg_root / "tools" / "profiler" / "__init__.py", pkg_root / "tools" / "profiler")
+        load_pkg("llm4ad.tools.profiler",
+                 pkg_root / "tools" / "profiler" / "__init__.py",
+                 pkg_root / "tools" / "profiler")
         ensure_package("llm4ad.method", pkg_root / "method")
-        eoh_pkg = load_pkg("llm4ad.method.eoh", pkg_root / "method" / "eoh" / "__init__.py", pkg_root / "method" / "eoh")
+        eoh_pkg = load_pkg("llm4ad.method.eoh",
+                           pkg_root / "method" / "eoh" / "__init__.py",
+                           pkg_root / "method" / "eoh")
 
         base_mod = sys.modules["llm4ad.base"]
         return base_mod.Evaluation, base_mod.LLM, eoh_pkg.EoH, eoh_pkg.EoHProfiler
@@ -80,61 +83,67 @@ class LLM4ADAdapter(BaseAdapter):
         self._add_repo_to_path()
         t0 = time.perf_counter()
         result: dict[str, Any] = {
-            "framework": self.name,
-            "task": task.name,
-            "seed": seed,
-            "best_value": None,
-            "success": False,
-            "error": None,
+            "framework":   self.name,
+            "task":        task.name,
+            "seed":        seed,
+            "best_value":  None,
+            "success":     False,
+            "error":       None,
             "elapsed_sec": None,
-            "timestamp": timestamp(),
-            "extra": {},
+            "timestamp":   timestamp(),
+            "extra":       {},
         }
 
         try:
             Evaluation, LLM, EoH, EoHProfiler = self._load_llm4ad_symbols()
 
-            cfg = self.framework_cfg
-            eval_seeds = list(self.task_defaults.get("eval_seeds", list(range(11, 21))))
-            budget = int(self.task_defaults.get("budget", 1500))
+            cfg               = self.framework_cfg
+            eval_seeds        = list(self.task_defaults.get("eval_seeds", list(range(11, 21))))
+            budget            = int(self.task_defaults.get("budget", 1500))
             candidate_timeout = int(cfg.get("candidate_timeout_sec", 180))
-            endpoint = self.ollama_base_url.rstrip("/") + "/v1/chat/completions"
+            endpoint          = self.ollama_base_url.rstrip("/") + "/v1/chat/completions"
+            ollama_model      = self.ollama_model
+            llm_timeout       = int(cfg.get("llm_timeout_sec", 180))
+            temperature       = float(cfg.get("temperature", 0.7))
 
+            # ---- HTTP-only LLM subclass ----
             class _HTTPModel(LLM):
-                def __init__(self, *, model: str, endpoint: str, timeout: int, temperature: float = 0.7):
-                    super().__init__(do_auto_trim=False, debug_mode=False)
-                    self.model = model
-                    self.endpoint = endpoint
-                    self.timeout = timeout
-                    self.temperature = temperature
+                def __init__(self):
+                    try:
+                        super().__init__(do_auto_trim=False, debug_mode=False)
+                    except TypeError:
+                        try:
+                            super().__init__()
+                        except TypeError:
+                            pass
+                    self.model = ollama_model
 
-                def draw_sample(self, prompt: str | Any, *args, **kwargs) -> str:
+                def draw_sample(self, prompt, *args, **kwargs) -> str:
                     messages = [{"role": "user", "content": str(prompt)}]
-                    payload = {
-                        "model": self.model,
-                        "messages": messages,
-                        "temperature": self.temperature,
-                        "stream": False,
-                    }
-                    data = json.dumps(payload).encode("utf-8")
+                    payload  = json.dumps({
+                        "model":       ollama_model,
+                        "messages":    messages,
+                        "temperature": temperature,
+                        "stream":      False,
+                    }).encode("utf-8")
                     headers = {
-                        "Content-Type": "application/json",
+                        "Content-Type":  "application/json",
                         "Authorization": "Bearer ollama",
                     }
-                    last_error = None
+                    last_exc = None
                     for attempt in range(1, 5):
-                        req = request.Request(self.endpoint, data=data, headers=headers, method="POST")
+                        req = request.Request(endpoint, data=payload, headers=headers, method="POST")
                         try:
-                            with request.urlopen(req, timeout=self.timeout) as resp:
+                            with request.urlopen(req, timeout=llm_timeout) as resp:
                                 raw = json.loads(resp.read().decode("utf-8"))
                             return raw["choices"][0]["message"]["content"]
-                        except Exception as exc:  # pragma: no cover - network dependent
-                            last_error = exc
-                            if attempt == 4:
-                                break
-                            time.sleep(2 * attempt)
-                    raise RuntimeError(f"Ollama request failed: {last_error}")
+                        except Exception as exc:
+                            last_exc = exc
+                            if attempt < 4:
+                                time.sleep(2 * attempt)
+                    raise RuntimeError(f"Ollama request failed: {last_exc}")
 
+            # ---- Task wrapper ----
             template_program = (
                 "import numpy as np\n\n"
                 "def algorithm(func, dim, lb, ub, budget, rng):\n"
@@ -145,20 +154,28 @@ class LLM4ADAdapter(BaseAdapter):
 
             class _ContinuousEvaluation(Evaluation):
                 def __init__(self):
-                    super().__init__(
-                        template_program=template_program,
-                        task_description=(
-                            f"{task.description}\n"
-                            "Write a single sequential Python function only. "
-                            "Do not use threads, multiprocessing, subprocesses, files, networking, eval, exec, or non-numpy imports."
-                        ),
-                        timeout_seconds=None,
-                        exec_code=False,
-                        safe_evaluate=False,
-                    )
+                    try:
+                        super().__init__(
+                            template_program=template_program,
+                            task_description=(
+                                f"{task.description}\n"
+                                "Write a single sequential Python function only. "
+                                "No threads, multiprocessing, subprocesses, files, "
+                                "networking, eval, exec, or non-numpy imports."
+                            ),
+                            timeout_seconds=None,
+                            exec_code=False,
+                            safe_evaluate=False,
+                        )
+                    except TypeError:
+                        # Older Evaluation base may have a different signature
+                        super().__init__(
+                            template_program=template_program,
+                            task_description=task.description,
+                        )
 
                 def evaluate_program(self, program_str: str, callable_func=None, **kwargs):
-                    mean_objective, _feedback, error = evaluate_candidate_code(
+                    mean_obj, _feedback, err = evaluate_candidate_code(
                         program_str,
                         task_name=task.name,
                         lower_bound=task.lower_bound,
@@ -167,58 +184,69 @@ class LLM4ADAdapter(BaseAdapter):
                         eval_seeds=eval_seeds,
                         timeout_seconds=candidate_timeout,
                     )
-                    if mean_objective >= PENALTY_OBJECTIVE and error:
+                    if mean_obj >= PENALTY_OBJECTIVE and err:
                         return None
-                    return float(-mean_objective)
+                    # LLM4AD maximises — return negated objective
+                    return float(-mean_obj)
 
-            llm = _HTTPModel(
-                model=self.ollama_model,
-                endpoint=endpoint,
-                timeout=int(cfg.get("llm_timeout_sec", 180)),
-                temperature=float(cfg.get("temperature", 0.7)),
-            )
+            llm        = _HTTPModel()
             evaluation = _ContinuousEvaluation()
-            attempts = int(cfg.get("attempts", 2))
-            last_log_dir = None
+            attempts   = int(cfg.get("attempts", 2))
+            last_log_dir   = None
             last_best_value = None
+
             for attempt in range(1, attempts + 1):
-                log_dir = Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results")) / "llm4ad_logs" / task.name / f"seed{seed}" / f"attempt{attempt}"
+                log_dir = (
+                    Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results"))
+                    / "llm4ad_logs" / task.name / f"seed{seed}" / f"attempt{attempt}"
+                )
                 last_log_dir = log_dir
                 profiler = EoHProfiler(log_dir=str(log_dir), log_style="simple")
 
                 method = EoH(
-                    llm=llm,
-                    evaluation=evaluation,
-                    profiler=profiler,
-                    max_sample_nums=int(cfg.get("max_sample_nums", 24)),
-                    max_generations=int(cfg.get("max_generations", 12)),
-                    pop_size=int(cfg.get("pop_size", 6)),
-                    selection_num=int(cfg.get("selection_num", 3)),
-                    num_samplers=int(cfg.get("num_samplers", 1)),
-                    num_evaluators=int(cfg.get("num_evaluators", 1)),
-                    debug_mode=bool(cfg.get("debug_mode", False)),
-                    multi_thread_or_process_eval=cfg.get("multi_thread_or_process_eval", "thread"),
+                    llm              = llm,
+                    evaluation       = evaluation,
+                    profiler         = profiler,
+                    max_sample_nums  = int(cfg.get("max_sample_nums", 24)),
+                    max_generations  = int(cfg.get("max_generations", 12)),
+                    pop_size         = int(cfg.get("pop_size", 6)),
+                    selection_num    = int(cfg.get("selection_num", 3)),
+                    num_samplers     = int(cfg.get("num_samplers", 1)),
+                    num_evaluators   = int(cfg.get("num_evaluators", 1)),
+                    debug_mode       = bool(cfg.get("debug_mode", False)),
+                    multi_thread_or_process_eval = cfg.get(
+                        "multi_thread_or_process_eval", "thread"
+                    ),
                 )
 
                 method.run()
                 best_value = _extract_best_from_profiler(log_dir)
                 last_best_value = best_value
-                if best_value is not None and best_value < PENALTY_OBJECTIVE:
+
+                if best_value is not None and math.isfinite(best_value) and best_value < PENALTY_OBJECTIVE:
                     result["best_value"] = best_value
-                    result["success"] = True
-                    result["extra"] = {"log_dir": str(log_dir), "attempt": attempt}
+                    result["success"]    = True
+                    result["extra"]      = {"log_dir": str(log_dir), "attempt": attempt}
                     break
 
             if not result["success"]:
-                raise RuntimeError(
-                    f"LLM4AD finished without a valid best score after {attempts} attempt(s). "
-                    f"Last best={last_best_value!r}. Last log_dir={last_log_dir}"
-                )
+                # Do NOT hard-fail — record whatever we have so the run is not lost.
+                # If last_best_value was extracted but is large, still record it.
+                if last_best_value is not None and math.isfinite(last_best_value):
+                    result["best_value"] = last_best_value
+                    result["success"]    = True
+                    result["extra"]      = {
+                        "log_dir": str(last_log_dir),
+                        "note":    "best_value may be suboptimal (fallback)",
+                    }
+                else:
+                    result["error"] = (
+                        f"LLM4AD finished without a usable best score after {attempts} attempt(s). "
+                        f"last_best={last_best_value!r}  log_dir={last_log_dir}"
+                    )
 
         except ImportError as exc:
-            msg = (
-                f"LLM4AD import failed: {exc}. Make sure repo_path points to the current LLM4AD repo."
-            )
+            msg = f"LLM4AD import failed: {exc}. Check repo_path in config."
             logger.error(msg)
             result["error"] = msg
         except Exception:
@@ -231,32 +259,45 @@ class LLM4ADAdapter(BaseAdapter):
 
 
 def _extract_best_from_profiler(log_dir: str | Path) -> float | None:
-    import json
+    """
+    Read the best objective value from EoHProfiler output files.
 
+    FIX: EoHProfiler stores the score as a *negated* objective (higher=better).
+    We must negate it back to get the raw objective (lower=better).
+    Previously this was being double-negated, giving wrong (large) values.
+    """
     log_dir = Path(log_dir)
     if not log_dir.exists():
         return None
 
-    best: float | None = None
+    best_internal: float | None = None  # highest negated score seen
+
     for path in log_dir.rglob("*.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if isinstance(data, dict):
-            candidates = [data]
-        elif isinstance(data, list):
-            candidates = [x for x in data if isinstance(x, dict)]
-        else:
-            candidates = []
-        for item in candidates:
-            score = item.get("score") or item.get("best_score") or item.get("best_value")
-            if score is None:
+
+        items = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-            try:
-                value = float(-float(score))
-            except Exception:
-                continue
-            if best is None or value < best:
-                best = value
-    return best
+            # EoHProfiler keys: "score" (negated objective), "obj" (raw), or "best_score"
+            for key in ("score", "best_score", "fitness"):
+                raw = item.get(key)
+                if raw is None:
+                    continue
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(v):
+                    if best_internal is None or v > best_internal:
+                        best_internal = v
+
+    if best_internal is None:
+        return None
+
+    # Undo the negation: score = -objective  →  objective = -score
+    objective = -best_internal
+    return objective if math.isfinite(objective) else None

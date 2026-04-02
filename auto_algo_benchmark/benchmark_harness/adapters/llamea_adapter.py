@@ -42,8 +42,8 @@ class LLaMEAAdapter(BaseAdapter):
         budget = int(self.task_defaults.get("budget", 1500))
         timeout_seconds = int(self.framework_cfg.get("candidate_timeout_sec", 180))
 
-        def evaluate_solution(individual, _logger):
-            mean_objective, feedback, error = evaluate_candidate_code(
+        def evaluate_solution(individual, _logger=None):
+            mean_objective, feedback, err = evaluate_candidate_code(
                 individual.code,
                 task_name=task.name,
                 lower_bound=task.lower_bound,
@@ -52,10 +52,9 @@ class LLaMEAAdapter(BaseAdapter):
                 eval_seeds=eval_seeds,
                 timeout_seconds=timeout_seconds,
             )
-            # LLaMEA maximises unless minimization=True. We use negative objective.
             individual.set_scores(-mean_objective, feedback=feedback)
-            if error:
-                individual.error = error
+            if err:
+                individual.error = err
             individual.add_metadata("mean_objective", mean_objective)
             return individual
 
@@ -67,7 +66,7 @@ class LLaMEAAdapter(BaseAdapter):
         timeout_seconds = int(self.framework_cfg.get("candidate_timeout_sec", 180))
 
         def evaluate_algorithm(solution_code: str):
-            mean_objective, feedback, error = evaluate_candidate_code(
+            mean_objective, feedback, err = evaluate_candidate_code(
                 solution_code,
                 task_name=task.name,
                 lower_bound=task.lower_bound,
@@ -78,198 +77,270 @@ class LLaMEAAdapter(BaseAdapter):
             )
             score = float(-mean_objective) if math.isfinite(mean_objective) else float(-PENALTY_OBJECTIVE)
             message = feedback or ""
-            if error:
-                message = (message + "\n" if message else "") + f"ERROR: {error}"
+            if err:
+                message = (message + "\n" if message else "") + f"ERROR: {err}"
             return score, message[:2000]
 
         return evaluate_algorithm
+
+    def _build_llm(self, LLaMEABaseLLM, cfg: dict):
+        """
+        Build an Ollama-backed LLM object compatible with the installed LLaMEA version.
+
+        Key fix: we never call super().__init__(api_key=..., model=..., base_url=...)
+        because those kwargs don't exist on the current LLaMEA LLM base class.
+        Instead we inspect the actual signature and only pass what it accepts,
+        then monkey-patch model/endpoint onto self afterwards.
+        """
+        ollama_endpoint = self.ollama_base_url.rstrip("/") + "/v1/chat/completions"
+        ollama_model    = self.ollama_model
+        llm_timeout     = int(cfg.get("llm_timeout_sec", 180))
+        temperature     = float(cfg.get("temperature", 0.7))
+
+        base_init_params = inspect.signature(LLaMEABaseLLM.__init__).parameters
+
+        class _OllamaLLM(LLaMEABaseLLM):
+            """Thin Ollama shim — pure urllib, zero extra deps."""
+
+            def __init__(self):
+                # Only pass kwargs that the base class actually accepts
+                init_kw = {}
+                for name, default in [
+                    ("do_auto_trim", False),
+                    ("debug_mode",   False),
+                    ("api_key",      "ollama"),
+                    ("model",        ollama_model),
+                    ("base_url",     ollama_endpoint),
+                ]:
+                    if name in base_init_params:
+                        init_kw[name] = default
+                try:
+                    super().__init__(**init_kw)
+                except TypeError:
+                    try:
+                        super().__init__()
+                    except TypeError:
+                        pass
+                # Ensure these attributes always exist regardless of base class
+                self.model        = ollama_model
+                self._ep          = ollama_endpoint
+                self._to          = llm_timeout
+                self._temp        = temperature
+
+            # Current LLaMEA interface
+            def query(self, session_messages, **kwargs):
+                return self._http(session_messages)
+
+            # Older / BLADE interface
+            def get_response(self, prompt, **kwargs):
+                return self._http([{"role": "user", "content": str(prompt)}])
+
+            def chat(self, messages, **kwargs):
+                return self._http(messages)
+
+            # Some versions call __call__
+            def __call__(self, prompt, **kwargs):
+                return self._http([{"role": "user", "content": str(prompt)}])
+
+            def _http(self, messages, retries: int = 4) -> str:
+                payload = json.dumps({
+                    "model":       ollama_model,
+                    "messages":    messages,
+                    "temperature": temperature,
+                    "stream":      False,
+                }).encode("utf-8")
+                headers = {
+                    "Content-Type":  "application/json",
+                    "Authorization": "Bearer ollama",
+                }
+                last_exc: Exception | None = None
+                for attempt in range(1, retries + 1):
+                    req = request.Request(
+                        ollama_endpoint, data=payload,
+                        headers=headers, method="POST"
+                    )
+                    try:
+                        with request.urlopen(req, timeout=llm_timeout) as resp:
+                            raw = json.loads(resp.read().decode("utf-8"))
+                        return raw["choices"][0]["message"]["content"]
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt < retries:
+                            time.sleep(2 * attempt)
+                raise RuntimeError(
+                    f"Ollama request failed after {retries} attempts: {last_exc}"
+                )
+
+        return _OllamaLLM()
 
     def run(self, task: BenchmarkTask, seed: int) -> dict[str, Any]:
         self._add_repo_to_path()
         t0 = time.perf_counter()
         result: dict[str, Any] = {
             "framework": self.name,
-            "task": task.name,
-            "seed": seed,
+            "task":      task.name,
+            "seed":      seed,
             "best_value": None,
-            "success": False,
-            "error": None,
+            "success":   False,
+            "error":     None,
             "elapsed_sec": None,
             "timestamp": timestamp(),
-            "extra": {},
+            "extra":     {},
         }
 
         try:
             import numpy as np
             from llamea import LLaMEA  # type: ignore
-            from llamea.llm import LLM as LLaMEABaseLLM  # type: ignore
+
+            # Locate the LLM base class — path differs across LLaMEA versions
+            LLaMEABaseLLM = None
+            for mod_path in ("llamea.llm", "llamea"):
+                try:
+                    mod = __import__(mod_path, fromlist=["LLM"])
+                    LLaMEABaseLLM = getattr(mod, "LLM", None)
+                    if LLaMEABaseLLM is not None:
+                        break
+                except ImportError:
+                    pass
+
+            if LLaMEABaseLLM is None:
+                # Absolute fallback — create a trivial base so _OllamaLLM still works
+                class LLaMEABaseLLM:  # type: ignore[no-redef]
+                    def __init__(self, **kwargs): pass
 
             random.seed(seed)
             np.random.seed(seed)
 
-            cfg = self.framework_cfg
+            cfg        = self.framework_cfg
+            llm        = self._build_llm(LLaMEABaseLLM, cfg)
             ctor_params = inspect.signature(LLaMEA.__init__).parameters
-            uses_current_api = "llm" in ctor_params and "f" in ctor_params
+            logger.debug("LLaMEA.__init__ params: %s", list(ctor_params.keys()))
 
-            if uses_current_api:
-                base_url = self.ollama_base_url.rstrip("/") + "/v1/chat/completions"
+            role_prompt = (
+                "You are an expert in black-box continuous optimisation. "
+                "Write a single sequential Python function only. "
+                "Do not use threads, multiprocessing, subprocesses, files, "
+                "network calls, eval, exec, or imports beyond numpy.\n\n"
+            )
+            task_prompt = (
+                f"Task: {task.description}\n\n"
+                "Return Python code only. Implement:\n"
+                "def algorithm(func, dim, lb, ub, budget, rng):\n"
+                "    ...\n"
+                "The function must return the best 1-D numpy array found.\n"
+                "Clip candidates to [lb, ub].\n"
+            )
 
-                class _OllamaHTTPAdapter(LLaMEABaseLLM):
-                    def __init__(self, *, model: str, endpoint: str, timeout: int, temperature: float = 0.7):
-                        super().__init__(api_key="ollama", model=model, base_url=endpoint)
-                        self.endpoint = endpoint
-                        self.timeout = timeout
-                        self.temperature = temperature
+            # ----------------------------------------------------------------
+            # Detect API variant by inspecting LLaMEA.__init__ parameters
+            # ----------------------------------------------------------------
+            has_llm_param = "llm" in ctor_params
+            has_f_param   = "f"   in ctor_params
 
-                    def query(self, session_messages, max_retries: int = 4, default_delay: int = 2):
-                        payload = {
-                            "model": self.model,
-                            "messages": session_messages,
-                            "temperature": self.temperature,
-                            "stream": False,
-                        }
-                        data = json.dumps(payload).encode("utf-8")
-                        headers = {
-                            "Content-Type": "application/json",
-                            "Authorization": "Bearer ollama",
-                        }
-                        last_error = None
-                        for attempt in range(1, max_retries + 1):
-                            req = request.Request(self.endpoint, data=data, headers=headers, method="POST")
-                            try:
-                                with request.urlopen(req, timeout=self.timeout) as resp:
-                                    raw = json.loads(resp.read().decode("utf-8"))
-                                return raw["choices"][0]["message"]["content"]
-                            except Exception as exc:  # pragma: no cover - network dependent
-                                last_error = exc
-                                if attempt == max_retries:
-                                    break
-                                time.sleep(default_delay * attempt)
-                        raise RuntimeError(f"Ollama request failed: {last_error}")
-
-                llm = _OllamaHTTPAdapter(
-                    model=self.ollama_model,
-                    endpoint=base_url,
-                    timeout=int(cfg.get("llm_timeout_sec", 180)),
-                    temperature=float(cfg.get("temperature", 0.7)),
+            if has_llm_param and has_f_param:
+                # ---- Current main-branch: LLaMEA(f, llm, budget, ...) ----
+                want = dict(
+                    f            = self._build_evaluator(task),
+                    llm          = llm,
+                    budget       = int(cfg.get("search_budget", 40)),
+                    n_parents    = int(cfg.get("n_parents", 4)),
+                    n_offspring  = int(cfg.get("n_offspring", 8)),
+                    role_prompt  = role_prompt,
+                    task_prompt  = task_prompt,
+                    experiment_name = f"llamea_{task.name}_seed{seed}",
+                    elitism      = bool(cfg.get("elitism", True)),
+                    eval_timeout = int(cfg.get("eval_timeout", 600)),
+                    max_workers  = int(cfg.get("max_workers", 1)),
+                    minimization = False,
+                    log          = bool(cfg.get("framework_log", True)),
+                    # Optional — only injected if constructor accepts them
+                    parallel_backend = cfg.get("parallel_backend", "loky"),
+                    parent_selection = cfg.get("parent_selection", "random"),
+                    tournament_size  = int(cfg.get("tournament_size", 3)),
+                    elitist          = bool(cfg.get("elitism", True)),
                 )
-
-                role_prompt = (
-                    "You are an expert in black-box continuous optimisation. "
-                    "Write a single sequential Python function only. "
-                    "Do not use threads, multiprocessing, subprocesses, files, network calls, eval, exec, or imports beyond numpy.\n\n"
-                )
-                task_prompt = (
-                    f"Task: {task.description}\n\n"
-                    "Return Python code only. Implement:\n"
-                    "def algorithm(func, dim, lb, ub, budget, rng):\n"
-                    "    ...\n"
-                    "The function must return the best 1-D numpy array found.\n"
-                    "Keep it numerically stable. Clip candidate vectors to [lb, ub].\n"
-                )
-
-                current_kwargs = {
-                    "f": self._build_evaluator(task),
-                    "llm": llm,
-                    "budget": int(cfg.get("search_budget", 40)),
-                    "n_parents": int(cfg.get("n_parents", 4)),
-                    "n_offspring": int(cfg.get("n_offspring", 8)),
-                    "role_prompt": role_prompt,
-                    "task_prompt": task_prompt,
-                    "experiment_name": f"llamea_{task.name}_seed{seed}",
-                    "elitism": bool(cfg.get("elitism", True)),
-                    "eval_timeout": int(cfg.get("eval_timeout", 600)),
-                    "max_workers": int(cfg.get("max_workers", 1)),
-                    "parallel_backend": cfg.get("parallel_backend", "loky"),
-                    "minimization": False,
-                    "log": bool(cfg.get("framework_log", True)),
-                    "parent_selection": cfg.get("parent_selection", "random"),
-                    "tournament_size": int(cfg.get("tournament_size", 3)),
-                }
-                optimizer = LLaMEA(**{k: v for k, v in current_kwargs.items() if k in ctor_params})
+                optimizer    = LLaMEA(**{k: v for k, v in want.items() if k in ctor_params})
                 best_solution = optimizer.run()
                 if best_solution is None:
-                    raise RuntimeError("LLaMEA returned no solution.")
+                    raise RuntimeError("LLaMEA.run() returned None.")
 
-                best_internal = float(best_solution.fitness)
-                best_value = float(-best_internal) if math.isfinite(best_internal) else PENALTY_OBJECTIVE
-                best_error = getattr(best_solution, "error", "") or "Candidate evaluation failed or no valid solution was produced."
-                if (not math.isfinite(best_internal)) or best_value >= PENALTY_OBJECTIVE:
-                    result["error"] = best_error
+                bi  = float(best_solution.fitness)
+                bv  = float(-bi) if math.isfinite(bi) else PENALTY_OBJECTIVE
+                if not math.isfinite(bi) or bv >= PENALTY_OBJECTIVE:
+                    result["error"]   = getattr(best_solution, "error", "") or "No valid solution."
                     result["success"] = False
                 else:
-                    result["best_value"] = best_value
-                    result["success"] = True
-
+                    result["best_value"] = bv
+                    result["success"]    = True
                 result["extra"] = {
-                    "api_variant": "current",
-                    "best_internal_score": best_internal,
-                    "best_name": getattr(best_solution, "name", ""),
-                    "best_feedback": getattr(best_solution, "feedback", "")[:1000],
-                    "best_error": getattr(best_solution, "error", "")[:1000],
+                    "api_variant":        "current",
+                    "best_internal_score": bi,
+                    "best_name":    getattr(best_solution, "name",     "")[:200],
+                    "best_feedback": getattr(best_solution, "feedback", "")[:500],
                 }
-            else:
-                base_url = self.ollama_base_url.rstrip("/") + "/v1"
-                legacy_kwargs = {
-                    "model": self.ollama_model,
-                    "api_key": "ollama",
-                    "base_url": base_url,
-                    "budget": int(cfg.get("search_budget", 40)),
-                    "n_parents": int(cfg.get("n_parents", 4)),
-                    "n_offspring": int(cfg.get("n_offspring", 8)),
-                    "role_prompt": (
-                        "You are an expert in black-box continuous optimisation. "
-                        "Write a single sequential Python function only. "
-                        "Do not use threads, multiprocessing, subprocesses, files, network calls, eval, exec, or imports beyond numpy.\n\n"
-                        f"Task: {task.description}\n\n"
-                    ),
-                    "task_prompt": f"Implement an optimisation algorithm for: {task.description}",
-                    "experiment_name": f"llamea_{task.name}_seed{seed}",
-                    "elitist": bool(cfg.get("elitism", True)),
-                    "elitism": bool(cfg.get("elitism", True)),
-                    "eval_timeout": int(cfg.get("eval_timeout", 600)),
-                    "max_workers": int(cfg.get("max_workers", 1)),
-                    "parallel_backend": cfg.get("parallel_backend", "loky"),
-                    "parent_selection": cfg.get("parent_selection", "random"),
-                    "tournament_size": int(cfg.get("tournament_size", 3)),
-                }
-                optimizer = LLaMEA(**{k: v for k, v in legacy_kwargs.items() if k in ctor_params})
+
+            elif has_llm_param and not has_f_param:
+                # ---- BLADE-style: LLaMEA(llm, budget=..., n_parents=...) ----
+                # Evaluation function is NOT passed to __init__
+                want = dict(
+                    llm         = llm,
+                    budget      = int(cfg.get("search_budget", 40)),
+                    n_parents   = int(cfg.get("n_parents", 4)),
+                    n_offspring = int(cfg.get("n_offspring", 8)),
+                    elitism     = bool(cfg.get("elitism", True)),
+                    name        = f"llamea_{task.name}_seed{seed}",
+                    role_prompt = role_prompt,
+                    task_prompt = task_prompt,
+                )
+                optimizer   = LLaMEA(**{k: v for k, v in want.items() if k in ctor_params})
                 legacy_eval = self._build_legacy_evaluator(task)
-                run_params = inspect.signature(optimizer.run).parameters
-                if len(run_params) >= 1:
-                    run_output = optimizer.run(legacy_eval)
-                else:
-                    run_output = optimizer.run()
-
-                best_score = None
-                extra = {"api_variant": "legacy"}
-                if isinstance(run_output, tuple):
-                    if len(run_output) >= 2:
-                        best_score = run_output[1]
-                    if len(run_output) >= 3:
-                        extra["log_summary"] = str(run_output[2])[:1000]
-                elif hasattr(run_output, "fitness"):
-                    best_score = getattr(run_output, "fitness")
-                    extra["best_name"] = getattr(run_output, "name", "")
-                    extra["best_feedback"] = getattr(run_output, "feedback", "")[:1000]
-                if best_score is None:
-                    raise RuntimeError("Legacy LLaMEA run finished without returning a best score.")
-
-                best_internal = float(best_score)
-                best_value = float(-best_internal) if math.isfinite(best_internal) else PENALTY_OBJECTIVE
-                if (not math.isfinite(best_internal)) or best_value >= PENALTY_OBJECTIVE:
-                    result["error"] = extra.get("log_summary") or "Legacy LLaMEA produced no valid solution."
+                run_params  = inspect.signature(optimizer.run).parameters
+                run_output  = optimizer.run(legacy_eval) if len(run_params) > 1 else optimizer.run()
+                bi, bv = _extract_score(run_output)
+                if bv is None or bv >= PENALTY_OBJECTIVE:
+                    result["error"]   = "BLADE LLaMEA produced no valid solution."
                     result["success"] = False
                 else:
-                    result["best_value"] = best_value
-                    result["success"] = True
-                extra["best_internal_score"] = best_internal
-                result["extra"] = extra
+                    result["best_value"] = bv
+                    result["success"]    = True
+                result["extra"] = {"api_variant": "blade", "best_internal_score": bi}
+
+            else:
+                # ---- Legacy: LLaMEA(model, api_key, base_url, budget, ...) ----
+                base_url = self.ollama_base_url.rstrip("/") + "/v1"
+                want = dict(
+                    model       = self.ollama_model,
+                    api_key     = "ollama",
+                    base_url    = base_url,
+                    budget      = int(cfg.get("search_budget", 40)),
+                    n_parents   = int(cfg.get("n_parents", 4)),
+                    n_offspring = int(cfg.get("n_offspring", 8)),
+                    role_prompt = role_prompt + task_prompt,
+                    task_prompt = task_prompt,
+                    experiment_name = f"llamea_{task.name}_seed{seed}",
+                    eval_timeout    = int(cfg.get("eval_timeout", 600)),
+                    max_workers     = int(cfg.get("max_workers", 1)),
+                    elitist         = bool(cfg.get("elitism", True)),
+                    elitism         = bool(cfg.get("elitism", True)),
+                    parallel_backend = cfg.get("parallel_backend", "loky"),
+                    parent_selection = cfg.get("parent_selection", "random"),
+                    tournament_size  = int(cfg.get("tournament_size", 3)),
+                )
+                optimizer   = LLaMEA(**{k: v for k, v in want.items() if k in ctor_params})
+                legacy_eval = self._build_legacy_evaluator(task)
+                run_params  = inspect.signature(optimizer.run).parameters
+                run_output  = optimizer.run(legacy_eval) if len(run_params) > 1 else optimizer.run()
+                bi, bv = _extract_score(run_output)
+                if bv is None or bv >= PENALTY_OBJECTIVE:
+                    result["error"]   = "Legacy LLaMEA produced no valid solution."
+                    result["success"] = False
+                else:
+                    result["best_value"] = bv
+                    result["success"]    = True
+                result["extra"] = {"api_variant": "legacy", "best_internal_score": bi}
 
         except ImportError as exc:
-            msg = (
-                f"LLaMEA import failed: {exc}. Make sure repo_path points to the current LLaMEA repo."
-            )
+            msg = f"LLaMEA import failed: {exc}. Check repo_path in config."
             logger.error(msg)
             result["error"] = msg
         except Exception:
@@ -279,3 +350,25 @@ class LLaMEAAdapter(BaseAdapter):
 
         result["elapsed_sec"] = round(time.perf_counter() - t0, 3)
         return result
+
+
+# ---------------------------------------------------------------------------
+
+def _extract_score(run_output) -> tuple[float | None, float | None]:
+    """Return (internal_score, best_value) from whatever run() returned."""
+    best_score = None
+    if isinstance(run_output, tuple):
+        if len(run_output) >= 2:
+            best_score = run_output[1]
+    elif hasattr(run_output, "fitness"):
+        best_score = getattr(run_output, "fitness")
+
+    if best_score is None:
+        return None, None
+    try:
+        bi = float(best_score)
+    except (TypeError, ValueError):
+        return None, None
+
+    bv = float(-bi) if math.isfinite(bi) else PENALTY_OBJECTIVE
+    return bi, bv
