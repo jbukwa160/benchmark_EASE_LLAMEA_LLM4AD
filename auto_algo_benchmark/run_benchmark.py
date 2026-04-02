@@ -6,7 +6,6 @@ import argparse
 import json
 import logging
 import os
-import shutil
 import sys
 import tempfile
 import time
@@ -113,41 +112,6 @@ def _write_heartbeat(output_dir: Path, payload: dict) -> None:
     atomic_write_json(output_dir / "heartbeat.json", payload)
 
 
-def _cleanup_previous_outputs(output_dir: Path, frameworks: list, task_names: list[str]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Remove stale top-level result and state files so a fresh run reuses the same
-    # output directory instead of acting as if old results still belong to this run.
-    for name in ("summary.csv", "progress.csv"):
-        path = output_dir / name
-        if path.exists():
-            path.unlink()
-
-    for adapter in frameworks:
-        for task_name in task_names:
-            path = output_dir / f"{adapter.name}_{task_name}.jsonl"
-            if path.exists():
-                path.unlink()
-
-    for subdir_name in ("_tmp", "logs"):
-        subdir = output_dir / subdir_name
-        if subdir.exists():
-            shutil.rmtree(subdir, ignore_errors=True)
-
-    framework_log_dirs = {"llm4ad": "llm4ad_logs", "llamea": "llamea_logs", "ease": "ease_logs"}
-    for adapter in frameworks:
-        subdir_name = framework_log_dirs.get(adapter.name)
-        if not subdir_name:
-            continue
-        subdir = output_dir / subdir_name
-        if subdir.exists():
-            shutil.rmtree(subdir, ignore_errors=True)
-
-    heartbeat = output_dir / "heartbeat.json"
-    if heartbeat.exists():
-        heartbeat.unlink()
-
-
 def _worker_main(worker_json_path: str) -> int:
     worker_payload = json.loads(Path(worker_json_path).read_text(encoding="utf-8"))
     config_path = Path(worker_payload["config_path"]).resolve()
@@ -197,10 +161,6 @@ def _run_isolated_experiment(
     log_path = logs_dir / f"{stem}.log"
     result_path = tmp_dir / f"{stem}.json"
     payload_path = tmp_dir / f"{stem}.payload.json"
-
-    for stale in (log_path, result_path, payload_path):
-        if stale.exists():
-            stale.unlink()
 
     payload = {
         "config_path": str(config_path),
@@ -318,12 +278,7 @@ def main() -> int:
         logger.info("Would run %s experiments.", total)
         return 0
 
-    append_mode = bool(cfg.get("append_results", False))
-    if not append_mode:
-        logger.info("append_results=false → clearing prior result files for this run")
-        _cleanup_previous_outputs(output_dir, adapters, task_names)
-
-    store = ResultStore(str(output_dir), append=append_mode)
+    store = ResultStore(str(output_dir), append=cfg.get("append_results", False))
 
     total = len(adapters) * len(task_names) * len(seeds)
     completed = 0
