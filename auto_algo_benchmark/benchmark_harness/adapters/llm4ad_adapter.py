@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import shutil
 import sys
 import time
 import traceback
@@ -13,6 +14,7 @@ from typing import Any
 from urllib import request
 
 from .base import BaseAdapter
+from ..config import resolve_repo_path
 from ..tasks import BenchmarkTask
 from ..utils import PENALTY_OBJECTIVE, evaluate_candidate_code, get_logger, timestamp
 
@@ -27,8 +29,8 @@ class LLM4ADAdapter(BaseAdapter):
 
     def _repo_path(self) -> Path:
         config_dir = Path(self.global_cfg.get("_config_dir", Path.cwd()))
-        repo = Path(self.framework_cfg.get("repo_path", "../LLM4AD"))
-        return repo if repo.is_absolute() else (config_dir / repo).resolve()
+        repo = self.framework_cfg.get("repo_path", "../LLM4AD")
+        return resolve_repo_path(config_dir, str(repo), "llm4ad")
 
     def _add_repo_to_path(self) -> None:
         p = self._repo_path()
@@ -118,6 +120,13 @@ class LLM4ADAdapter(BaseAdapter):
                             pass
                     self.model = ollama_model
 
+                @staticmethod
+                def _normalize_response(text: str) -> str:
+                    text = str(text or "").strip()
+                    if "{" not in text or "}" not in text:
+                        text = "{Generated algorithm}\n" + text
+                    return text
+
                 def draw_sample(self, prompt, *args, **kwargs) -> str:
                     messages = [{"role": "user", "content": str(prompt)}]
                     payload  = json.dumps({
@@ -136,7 +145,8 @@ class LLM4ADAdapter(BaseAdapter):
                         try:
                             with request.urlopen(req, timeout=llm_timeout) as resp:
                                 raw = json.loads(resp.read().decode("utf-8"))
-                            return raw["choices"][0]["message"]["content"]
+                            content = raw["choices"][0]["message"]["content"]
+                            return self._normalize_response(content)
                         except Exception as exc:
                             last_exc = exc
                             if attempt < 4:
@@ -200,6 +210,9 @@ class LLM4ADAdapter(BaseAdapter):
                     Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results"))
                     / "llm4ad_logs" / task.name / f"seed{seed}" / f"attempt{attempt}"
                 )
+                if log_dir.exists():
+                    shutil.rmtree(log_dir, ignore_errors=True)
+                log_dir.parent.mkdir(parents=True, exist_ok=True)
                 last_log_dir = log_dir
                 profiler = EoHProfiler(log_dir=str(log_dir), log_style="simple")
 

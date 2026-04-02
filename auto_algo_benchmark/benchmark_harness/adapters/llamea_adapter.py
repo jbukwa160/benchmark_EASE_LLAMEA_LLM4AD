@@ -1,23 +1,244 @@
-"""Adapter for the current LLaMEA repository, hardened for unattended runs."""
+"""Adapter for LLaMEA — fixes pickling of the LLM object in pickle_archive."""
 
 from __future__ import annotations
 
 import inspect
 import json
 import math
+import pickle
 import random
+import shutil
 import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Any
-from urllib import error, request
+from urllib import request as _urllib_request
 
 from .base import BaseAdapter
+from ..config import resolve_repo_path
 from ..tasks import BenchmarkTask
 from ..utils import PENALTY_OBJECTIVE, evaluate_candidate_code, get_logger, timestamp
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Global registry so pickle can reconstruct OllamaLLM instances by ID
+# ---------------------------------------------------------------------------
+# When pickle serialises an OllamaLLM it stores (_reconstruct_ollama_llm, (id,))
+# and the id maps back to the constructor args held here.
+_OLLAMA_LLM_REGISTRY: dict[int, dict] = {}
+_OLLAMA_LLM_COUNTER = 0
+
+
+def _reconstruct_ollama_llm(registry_id: int):
+    """Called by pickle to rebuild an OllamaLLM after unpickling."""
+    args = _OLLAMA_LLM_REGISTRY.get(registry_id)
+    if args is None:
+        raise pickle.UnpicklingError(
+            f"OllamaLLM registry id {registry_id} not found. "
+            "This usually means pickling happened in a different process."
+        )
+    return _build_ollama_llm_instance(**args)
+
+
+def _build_ollama_llm_instance(*, LLaMEABaseLLM_module: str,
+                                LLaMEABaseLLM_name: str,
+                                endpoint: str, model: str,
+                                timeout: int, temperature: float,
+                                registry_id: int):
+    """Reconstruct the OllamaLLM from serialisable parts."""
+    import importlib
+    mod = importlib.import_module(LLaMEABaseLLM_module)
+    LLaMEABaseLLM = getattr(mod, LLaMEABaseLLM_name)
+    return _make_ollama_llm(
+        LLaMEABaseLLM, endpoint=endpoint, model=model,
+        timeout=timeout, temperature=temperature,
+        _registry_id=registry_id,
+    )
+
+
+def _make_ollama_llm(LLaMEABaseLLM, *, endpoint: str, model: str,
+                     timeout: int, temperature: float,
+                     _registry_id: int | None = None):
+    """
+    Create an OllamaLLM that:
+      1. Inherits from LLaMEABaseLLM so LLaMEA's type-checks pass.
+      2. Is fully picklable via __reduce__ (needed for LLaMEA's pickle_archive).
+      3. Routes all LLM calls to Ollama over HTTP.
+    """
+    global _OLLAMA_LLM_COUNTER
+
+    # Register this instance so pickle can reconstruct it
+    if _registry_id is None:
+        _OLLAMA_LLM_COUNTER += 1
+        _registry_id = _OLLAMA_LLM_COUNTER
+
+    base_init_params = inspect.signature(LLaMEABaseLLM.__init__).parameters
+    init_kw: dict[str, Any] = {}
+    for name, val in [
+        ("api_key",      "ollama"),
+        ("model",        model),
+        ("base_url",     endpoint),
+        ("do_auto_trim", False),
+        ("debug_mode",   False),
+    ]:
+        if name in base_init_params:
+            init_kw[name] = val
+
+    # Store constructor args in registry for pickle reconstruction
+    _OLLAMA_LLM_REGISTRY[_registry_id] = dict(
+        LLaMEABaseLLM_module = LLaMEABaseLLM.__module__,
+        LLaMEABaseLLM_name   = LLaMEABaseLLM.__name__,
+        endpoint    = endpoint,
+        model       = model,
+        timeout     = timeout,
+        temperature = temperature,
+        registry_id = _registry_id,
+    )
+
+    class OllamaLLM(LLaMEABaseLLM):  # type: ignore[misc,valid-type]
+
+        def __init__(self):
+            try:
+                LLaMEABaseLLM.__init__(self, **init_kw)
+            except TypeError:
+                try:
+                    LLaMEABaseLLM.__init__(self)
+                except TypeError:
+                    pass
+            self.model        = model
+            self._endpoint    = endpoint
+            self._model       = model
+            self._timeout     = timeout
+            self._temperature = temperature
+            self._registry_id = _registry_id
+
+        # ---- Pickle support -----------------------------------------------
+        def __reduce__(self):
+            return (_reconstruct_ollama_llm, (self._registry_id,))
+
+        def __getstate__(self):
+            return {"_registry_id": self._registry_id}
+
+        def __setstate__(self, state):
+            args = _OLLAMA_LLM_REGISTRY.get(state["_registry_id"], {})
+            self._registry_id = state["_registry_id"]
+            self._endpoint    = args.get("endpoint",    "")
+            self._model       = args.get("model",       "")
+            self._timeout     = args.get("timeout",     180)
+            self._temperature = args.get("temperature", 0.7)
+            self.model        = self._model
+
+        # ---- LLaMEA LLM interface -----------------------------------------
+        def query(self, session_messages, **kwargs) -> str:
+            return self._http(session_messages)
+
+        def get_response(self, prompt, **kwargs) -> str:
+            return self._http([{"role": "user", "content": str(prompt)}])
+
+        def chat(self, messages, **kwargs) -> str:
+            return self._http(messages)
+
+        def __call__(self, prompt, **kwargs) -> str:
+            return self._http([{"role": "user", "content": str(prompt)}])
+
+        @staticmethod
+        def _normalize_response(text: str) -> str:
+            text = str(text or "").strip()
+            if "```" not in text:
+                text = f"```python\n{text}\n```"
+            return text
+
+        # ---- HTTP core -------------------------------------------------------
+        def _http(self, messages, retries: int = 4) -> str:
+            payload = json.dumps({
+                "model":       self._model,
+                "messages":    messages,
+                "temperature": self._temperature,
+                "stream":      False,
+            }).encode("utf-8")
+            headers = {
+                "Content-Type":  "application/json",
+                "Authorization": "Bearer ollama",
+            }
+            last_exc: Exception | None = None
+            for attempt in range(1, retries + 1):
+                req = _urllib_request.Request(
+                    self._endpoint, data=payload,
+                    headers=headers, method="POST"
+                )
+                try:
+                    with _urllib_request.urlopen(req, timeout=self._timeout) as resp:
+                        raw = json.loads(resp.read().decode("utf-8"))
+                    content = raw["choices"][0]["message"]["content"]
+                    return self._normalize_response(content)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < retries:
+                        time.sleep(2 * attempt)
+            raise RuntimeError(
+                f"Ollama request failed after {retries} attempts: {last_exc}"
+            )
+
+    OllamaLLM.__name__     = "OllamaLLM"
+    OllamaLLM.__qualname__ = "OllamaLLM"
+    OllamaLLM.__module__   = __name__
+
+    return OllamaLLM()
+
+
+class _LLaMEAEvaluator:
+    """Picklable top-level evaluator used by LLaMEA."""
+
+    def __init__(self, *, task_name: str, lower_bound: float, upper_bound: float,
+                 budget: int, eval_seeds: list[int], timeout_seconds: int):
+        self.task_name = task_name
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+        self.budget = budget
+        self.eval_seeds = list(eval_seeds)
+        self.timeout_seconds = timeout_seconds
+
+    def __call__(self, individual, _logger=None):
+        mean_objective, feedback, err = evaluate_candidate_code(
+            individual.code,
+            task_name=self.task_name,
+            lower_bound=self.lower_bound,
+            upper_bound=self.upper_bound,
+            budget=self.budget,
+            eval_seeds=self.eval_seeds,
+            timeout_seconds=self.timeout_seconds,
+        )
+        individual.set_scores(-mean_objective, feedback=feedback)
+        if err:
+            individual.error = err
+        individual.add_metadata("mean_objective", mean_objective)
+        return individual
+
+
+# ---------------------------------------------------------------------------
+# Adapter
+# ---------------------------------------------------------------------------
+
+
+
+def _safe_pickle_archive_method(self, *args, **kwargs):
+    """
+    Class-level wrapper for LLaMEA.pickle_archive that converts pickling
+    failures into non-fatal warnings without making the optimizer instance
+    itself unpicklable.
+    """
+    optimizer_cls = self.__class__
+    original = getattr(optimizer_cls, "_auto_algo_original_pickle_archive", None)
+    if original is None:
+        return None
+    try:
+        return original(self, *args, **kwargs)
+    except (pickle.PicklingError, TypeError, AttributeError) as exc:
+        logger.debug("LLaMEA pickle_archive skipped (not fatal): %s", exc)
+        return None
 
 
 class LLaMEAAdapter(BaseAdapter):
@@ -28,8 +249,8 @@ class LLaMEAAdapter(BaseAdapter):
 
     def _repo_path(self) -> Path:
         config_dir = Path(self.global_cfg.get("_config_dir", Path.cwd()))
-        repo = Path(self.framework_cfg.get("repo_path", "../LLaMEA"))
-        return repo if repo.is_absolute() else (config_dir / repo).resolve()
+        repo = self.framework_cfg.get("repo_path", "../LLaMEA")
+        return resolve_repo_path(config_dir, str(repo), "llamea")
 
     def _add_repo_to_path(self) -> None:
         p = self._repo_path()
@@ -38,161 +259,77 @@ class LLaMEAAdapter(BaseAdapter):
             logger.debug("Added LLaMEA repo to sys.path: %s", p)
 
     def _build_evaluator(self, task: BenchmarkTask):
+        """Evaluator compatible with current LLaMEA API and safe to pickle."""
         eval_seeds = list(self.task_defaults.get("eval_seeds", list(range(11, 21))))
         budget = int(self.task_defaults.get("budget", 1500))
         timeout_seconds = int(self.framework_cfg.get("candidate_timeout_sec", 180))
+        return _LLaMEAEvaluator(
+            task_name=task.name,
+            lower_bound=task.lower_bound,
+            upper_bound=task.upper_bound,
+            budget=budget,
+            eval_seeds=eval_seeds,
+            timeout_seconds=timeout_seconds,
+        )
 
-        def evaluate_solution(individual, _logger=None):
-            mean_objective, feedback, err = evaluate_candidate_code(
-                individual.code,
-                task_name=task.name,
-                lower_bound=task.lower_bound,
-                upper_bound=task.upper_bound,
-                budget=budget,
-                eval_seeds=eval_seeds,
-                timeout_seconds=timeout_seconds,
-            )
-            individual.set_scores(-mean_objective, feedback=feedback)
-            if err:
-                individual.error = err
-            individual.add_metadata("mean_objective", mean_objective)
-            return individual
 
-        return evaluate_solution
+    def _llamea_log_dir(self, task: BenchmarkTask, seed: int) -> Path:
+        return (
+            Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results"))
+            / "llamea_logs" / task.name / f"seed{seed}"
+        )
 
-    def _build_legacy_evaluator(self, task: BenchmarkTask):
-        eval_seeds = list(self.task_defaults.get("eval_seeds", list(range(11, 21))))
-        budget = int(self.task_defaults.get("budget", 1500))
-        timeout_seconds = int(self.framework_cfg.get("candidate_timeout_sec", 180))
+    @staticmethod
+    def _patch_experiment_logger(log_dir: Path):
+        import llamea.loggers as llamea_loggers  # type: ignore
 
-        def evaluate_algorithm(solution_code: str):
-            mean_objective, feedback, err = evaluate_candidate_code(
-                solution_code,
-                task_name=task.name,
-                lower_bound=task.lower_bound,
-                upper_bound=task.upper_bound,
-                budget=budget,
-                eval_seeds=eval_seeds,
-                timeout_seconds=timeout_seconds,
-            )
-            score = float(-mean_objective) if math.isfinite(mean_objective) else float(-PENALTY_OBJECTIVE)
-            message = feedback or ""
-            if err:
-                message = (message + "\n" if message else "") + f"ERROR: {err}"
-            return score, message[:2000]
+        original_create_log_dir = llamea_loggers.ExperimentLogger.create_log_dir
 
-        return evaluate_algorithm
+        def stable_create_log_dir(self, name=""):
+            if log_dir.exists():
+                shutil.rmtree(log_dir, ignore_errors=True)
+            (log_dir / "configspace").mkdir(parents=True, exist_ok=True)
+            (log_dir / "code").mkdir(parents=True, exist_ok=True)
+            return str(log_dir)
 
-    def _build_llm(self, LLaMEABaseLLM, cfg: dict):
+        llamea_loggers.ExperimentLogger.create_log_dir = stable_create_log_dir
+        return llamea_loggers.ExperimentLogger, original_create_log_dir
+
+    @staticmethod
+    def _patch_pickle_archive(optimizer):
         """
-        Build an Ollama-backed LLM object compatible with the installed LLaMEA version.
-
-        Key fix: we never call super().__init__(api_key=..., model=..., base_url=...)
-        because those kwargs don't exist on the current LLaMEA LLM base class.
-        Instead we inspect the actual signature and only pass what it accepts,
-        then monkey-patch model/endpoint onto self afterwards.
+        Patch LLaMEA's pickle_archive at the *class* level so the optimizer
+        instance itself does not hold a local function in its __dict__.
+        Returns the original method so callers can restore it afterwards.
         """
-        ollama_endpoint = self.ollama_base_url.rstrip("/") + "/v1/chat/completions"
-        ollama_model    = self.ollama_model
-        llm_timeout     = int(cfg.get("llm_timeout_sec", 180))
-        temperature     = float(cfg.get("temperature", 0.7))
+        optimizer_cls = optimizer.__class__
+        original = getattr(optimizer_cls, "pickle_archive", None)
+        if original is None:
+            return None
 
-        base_init_params = inspect.signature(LLaMEABaseLLM.__init__).parameters
-
-        class _OllamaLLM(LLaMEABaseLLM):
-            """Thin Ollama shim — pure urllib, zero extra deps."""
-
-            def __init__(self):
-                # Only pass kwargs that the base class actually accepts
-                init_kw = {}
-                for name, default in [
-                    ("do_auto_trim", False),
-                    ("debug_mode",   False),
-                    ("api_key",      "ollama"),
-                    ("model",        ollama_model),
-                    ("base_url",     ollama_endpoint),
-                ]:
-                    if name in base_init_params:
-                        init_kw[name] = default
-                try:
-                    super().__init__(**init_kw)
-                except TypeError:
-                    try:
-                        super().__init__()
-                    except TypeError:
-                        pass
-                # Ensure these attributes always exist regardless of base class
-                self.model        = ollama_model
-                self._ep          = ollama_endpoint
-                self._to          = llm_timeout
-                self._temp        = temperature
-
-            # Current LLaMEA interface
-            def query(self, session_messages, **kwargs):
-                return self._http(session_messages)
-
-            # Older / BLADE interface
-            def get_response(self, prompt, **kwargs):
-                return self._http([{"role": "user", "content": str(prompt)}])
-
-            def chat(self, messages, **kwargs):
-                return self._http(messages)
-
-            # Some versions call __call__
-            def __call__(self, prompt, **kwargs):
-                return self._http([{"role": "user", "content": str(prompt)}])
-
-            def _http(self, messages, retries: int = 4) -> str:
-                payload = json.dumps({
-                    "model":       ollama_model,
-                    "messages":    messages,
-                    "temperature": temperature,
-                    "stream":      False,
-                }).encode("utf-8")
-                headers = {
-                    "Content-Type":  "application/json",
-                    "Authorization": "Bearer ollama",
-                }
-                last_exc: Exception | None = None
-                for attempt in range(1, retries + 1):
-                    req = request.Request(
-                        ollama_endpoint, data=payload,
-                        headers=headers, method="POST"
-                    )
-                    try:
-                        with request.urlopen(req, timeout=llm_timeout) as resp:
-                            raw = json.loads(resp.read().decode("utf-8"))
-                        return raw["choices"][0]["message"]["content"]
-                    except Exception as exc:
-                        last_exc = exc
-                        if attempt < retries:
-                            time.sleep(2 * attempt)
-                raise RuntimeError(
-                    f"Ollama request failed after {retries} attempts: {last_exc}"
-                )
-
-        return _OllamaLLM()
+        setattr(optimizer_cls, "pickle_archive", _safe_pickle_archive_method)
+        return optimizer_cls, original
 
     def run(self, task: BenchmarkTask, seed: int) -> dict[str, Any]:
         self._add_repo_to_path()
         t0 = time.perf_counter()
         result: dict[str, Any] = {
-            "framework": self.name,
-            "task":      task.name,
-            "seed":      seed,
-            "best_value": None,
-            "success":   False,
-            "error":     None,
-            "elapsed_sec": None,
-            "timestamp": timestamp(),
-            "extra":     {},
+            "framework":    self.name,
+            "task":         task.name,
+            "seed":         seed,
+            "best_value":   None,
+            "success":      False,
+            "error":        None,
+            "elapsed_sec":  None,
+            "timestamp":    timestamp(),
+            "extra":        {},
         }
 
         try:
             import numpy as np
             from llamea import LLaMEA  # type: ignore
 
-            # Locate the LLM base class — path differs across LLaMEA versions
+            # Locate LLM base class
             LLaMEABaseLLM = None
             for mod_path in ("llamea.llm", "llamea"):
                 try:
@@ -202,9 +339,7 @@ class LLaMEAAdapter(BaseAdapter):
                         break
                 except ImportError:
                     pass
-
             if LLaMEABaseLLM is None:
-                # Absolute fallback — create a trivial base so _OllamaLLM still works
                 class LLaMEABaseLLM:  # type: ignore[no-redef]
                     def __init__(self, **kwargs): pass
 
@@ -212,9 +347,17 @@ class LLaMEAAdapter(BaseAdapter):
             np.random.seed(seed)
 
             cfg        = self.framework_cfg
-            llm        = self._build_llm(LLaMEABaseLLM, cfg)
-            ctor_params = inspect.signature(LLaMEA.__init__).parameters
-            logger.debug("LLaMEA.__init__ params: %s", list(ctor_params.keys()))
+            framework_log = bool(cfg.get("framework_log", True))
+            log_dir = self._llamea_log_dir(task, seed)
+            ollama_v1  = self.ollama_base_url.rstrip("/") + "/v1/chat/completions"
+
+            llm = _make_ollama_llm(
+                LLaMEABaseLLM,
+                endpoint    = ollama_v1,
+                model       = self.ollama_model,
+                timeout     = int(cfg.get("llm_timeout_sec", 180)),
+                temperature = float(cfg.get("temperature", 0.7)),
+            )
 
             role_prompt = (
                 "You are an expert in black-box continuous optimisation. "
@@ -231,113 +374,87 @@ class LLaMEAAdapter(BaseAdapter):
                 "Clip candidates to [lb, ub].\n"
             )
 
-            # ----------------------------------------------------------------
-            # Detect API variant by inspecting LLaMEA.__init__ parameters
-            # ----------------------------------------------------------------
-            has_llm_param = "llm" in ctor_params
-            has_f_param   = "f"   in ctor_params
+            ctor_params = inspect.signature(LLaMEA.__init__).parameters
+            max_workers = int(cfg.get("max_workers", 1))
+            parallel_backend = cfg.get("parallel_backend", "threading" if max_workers <= 1 else "loky")
 
-            if has_llm_param and has_f_param:
-                # ---- Current main-branch: LLaMEA(f, llm, budget, ...) ----
-                want = dict(
-                    f            = self._build_evaluator(task),
-                    llm          = llm,
-                    budget       = int(cfg.get("search_budget", 40)),
-                    n_parents    = int(cfg.get("n_parents", 4)),
-                    n_offspring  = int(cfg.get("n_offspring", 8)),
-                    role_prompt  = role_prompt,
-                    task_prompt  = task_prompt,
-                    experiment_name = f"llamea_{task.name}_seed{seed}",
-                    elitism      = bool(cfg.get("elitism", True)),
-                    eval_timeout = int(cfg.get("eval_timeout", 600)),
-                    max_workers  = int(cfg.get("max_workers", 1)),
-                    minimization = False,
-                    log          = bool(cfg.get("framework_log", True)),
-                    # Optional — only injected if constructor accepts them
-                    parallel_backend = cfg.get("parallel_backend", "loky"),
-                    parent_selection = cfg.get("parent_selection", "random"),
-                    tournament_size  = int(cfg.get("tournament_size", 3)),
-                    elitist          = bool(cfg.get("elitism", True)),
-                )
-                optimizer    = LLaMEA(**{k: v for k, v in want.items() if k in ctor_params})
-                best_solution = optimizer.run()
-                if best_solution is None:
-                    raise RuntimeError("LLaMEA.run() returned None.")
+            logger_patch = None
+            if framework_log:
+                logger_patch = self._patch_experiment_logger(log_dir)
 
-                bi  = float(best_solution.fitness)
-                bv  = float(-bi) if math.isfinite(bi) else PENALTY_OBJECTIVE
-                if not math.isfinite(bi) or bv >= PENALTY_OBJECTIVE:
-                    result["error"]   = getattr(best_solution, "error", "") or "No valid solution."
-                    result["success"] = False
-                else:
-                    result["best_value"] = bv
-                    result["success"]    = True
-                result["extra"] = {
-                    "api_variant":        "current",
-                    "best_internal_score": bi,
-                    "best_name":    getattr(best_solution, "name",     "")[:200],
-                    "best_feedback": getattr(best_solution, "feedback", "")[:500],
-                }
+            want: dict[str, Any] = dict(
+                f                = self._build_evaluator(task),
+                llm              = llm,
+                budget           = int(cfg.get("search_budget", 40)),
+                n_parents        = int(cfg.get("n_parents", 4)),
+                n_offspring      = int(cfg.get("n_offspring", 8)),
+                role_prompt      = role_prompt,
+                task_prompt      = task_prompt,
+                experiment_name  = f"llamea_{task.name}_seed{seed}",
+                elitism          = bool(cfg.get("elitism", True)),
+                eval_timeout     = int(cfg.get("eval_timeout", 600)),
+                max_workers      = max_workers,
+                minimization     = False,
+                log              = framework_log,
+                parallel_backend = parallel_backend,
+                parent_selection = cfg.get("parent_selection", "random"),
+                tournament_size  = int(cfg.get("tournament_size", 3)),
+            )
+            filtered  = {k: v for k, v in want.items() if k in ctor_params}
+            optimizer = LLaMEA(**filtered)
 
-            elif has_llm_param and not has_f_param:
-                # ---- BLADE-style: LLaMEA(llm, budget=..., n_parents=...) ----
-                # Evaluation function is NOT passed to __init__
-                want = dict(
-                    llm         = llm,
-                    budget      = int(cfg.get("search_budget", 40)),
-                    n_parents   = int(cfg.get("n_parents", 4)),
-                    n_offspring = int(cfg.get("n_offspring", 8)),
-                    elitism     = bool(cfg.get("elitism", True)),
-                    name        = f"llamea_{task.name}_seed{seed}",
-                    role_prompt = role_prompt,
-                    task_prompt = task_prompt,
-                )
-                optimizer   = LLaMEA(**{k: v for k, v in want.items() if k in ctor_params})
-                legacy_eval = self._build_legacy_evaluator(task)
-                run_params  = inspect.signature(optimizer.run).parameters
-                run_output  = optimizer.run(legacy_eval) if len(run_params) > 1 else optimizer.run()
-                bi, bv = _extract_score(run_output)
-                if bv is None or bv >= PENALTY_OBJECTIVE:
-                    result["error"]   = "BLADE LLaMEA produced no valid solution."
-                    result["success"] = False
-                else:
-                    result["best_value"] = bv
-                    result["success"]    = True
-                result["extra"] = {"api_variant": "blade", "best_internal_score": bi}
-
+            pickle_patch = self._patch_pickle_archive(optimizer)
+            if pickle_patch is not None:
+                optimizer_cls, original_pickle_archive = pickle_patch
+                setattr(optimizer_cls, "_auto_algo_original_pickle_archive", original_pickle_archive)
             else:
-                # ---- Legacy: LLaMEA(model, api_key, base_url, budget, ...) ----
-                base_url = self.ollama_base_url.rstrip("/") + "/v1"
-                want = dict(
-                    model       = self.ollama_model,
-                    api_key     = "ollama",
-                    base_url    = base_url,
-                    budget      = int(cfg.get("search_budget", 40)),
-                    n_parents   = int(cfg.get("n_parents", 4)),
-                    n_offspring = int(cfg.get("n_offspring", 8)),
-                    role_prompt = role_prompt + task_prompt,
-                    task_prompt = task_prompt,
-                    experiment_name = f"llamea_{task.name}_seed{seed}",
-                    eval_timeout    = int(cfg.get("eval_timeout", 600)),
-                    max_workers     = int(cfg.get("max_workers", 1)),
-                    elitist         = bool(cfg.get("elitism", True)),
-                    elitism         = bool(cfg.get("elitism", True)),
-                    parallel_backend = cfg.get("parallel_backend", "loky"),
-                    parent_selection = cfg.get("parent_selection", "random"),
-                    tournament_size  = int(cfg.get("tournament_size", 3)),
+                optimizer_cls = None
+                original_pickle_archive = None
+
+            if logger_patch is not None:
+                _, original_create_log_dir = logger_patch
+                try:
+                    best_solution = optimizer.run()
+                finally:
+                    import llamea.loggers as llamea_loggers  # type: ignore
+                    llamea_loggers.ExperimentLogger.create_log_dir = original_create_log_dir
+                    if optimizer_cls is not None and original_pickle_archive is not None:
+                        setattr(optimizer_cls, "pickle_archive", original_pickle_archive)
+                        if hasattr(optimizer_cls, "_auto_algo_original_pickle_archive"):
+                            delattr(optimizer_cls, "_auto_algo_original_pickle_archive")
+            else:
+                try:
+                    best_solution = optimizer.run()
+                finally:
+                    if optimizer_cls is not None and original_pickle_archive is not None:
+                        setattr(optimizer_cls, "pickle_archive", original_pickle_archive)
+                        if hasattr(optimizer_cls, "_auto_algo_original_pickle_archive"):
+                            delattr(optimizer_cls, "_auto_algo_original_pickle_archive")
+
+            if best_solution is None:
+                raise RuntimeError("LLaMEA.run() returned None.")
+
+            bi = float(best_solution.fitness)
+            bv = float(-bi) if math.isfinite(bi) else PENALTY_OBJECTIVE
+
+            if not math.isfinite(bi) or bv >= PENALTY_OBJECTIVE:
+                result["error"]   = (
+                    getattr(best_solution, "error", "")
+                    or "No valid solution produced."
                 )
-                optimizer   = LLaMEA(**{k: v for k, v in want.items() if k in ctor_params})
-                legacy_eval = self._build_legacy_evaluator(task)
-                run_params  = inspect.signature(optimizer.run).parameters
-                run_output  = optimizer.run(legacy_eval) if len(run_params) > 1 else optimizer.run()
-                bi, bv = _extract_score(run_output)
-                if bv is None or bv >= PENALTY_OBJECTIVE:
-                    result["error"]   = "Legacy LLaMEA produced no valid solution."
-                    result["success"] = False
-                else:
-                    result["best_value"] = bv
-                    result["success"]    = True
-                result["extra"] = {"api_variant": "legacy", "best_internal_score": bi}
+                result["success"] = False
+            else:
+                result["best_value"] = bv
+                result["success"]    = True
+
+            result["extra"] = {
+                "best_internal_score": bi,
+                "best_name":     getattr(best_solution, "name",     "")[:200],
+                "best_feedback": getattr(best_solution, "feedback", "")[:500],
+                "best_error":    getattr(best_solution, "error",    "")[:500],
+            }
+            if framework_log:
+                result["extra"]["log_dir"] = str(log_dir)
 
         except ImportError as exc:
             msg = f"LLaMEA import failed: {exc}. Check repo_path in config."
@@ -350,25 +467,3 @@ class LLaMEAAdapter(BaseAdapter):
 
         result["elapsed_sec"] = round(time.perf_counter() - t0, 3)
         return result
-
-
-# ---------------------------------------------------------------------------
-
-def _extract_score(run_output) -> tuple[float | None, float | None]:
-    """Return (internal_score, best_value) from whatever run() returned."""
-    best_score = None
-    if isinstance(run_output, tuple):
-        if len(run_output) >= 2:
-            best_score = run_output[1]
-    elif hasattr(run_output, "fitness"):
-        best_score = getattr(run_output, "fitness")
-
-    if best_score is None:
-        return None, None
-    try:
-        bi = float(best_score)
-    except (TypeError, ValueError):
-        return None, None
-
-    bv = float(-bi) if math.isfinite(bi) else PENALTY_OBJECTIVE
-    return bi, bv
