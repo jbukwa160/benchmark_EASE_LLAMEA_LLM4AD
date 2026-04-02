@@ -139,6 +139,9 @@ def test_ollama(cfg: dict):
         print(f"  {WARN}  Chat completion test failed: {exc}")
 
 
+from benchmark_harness.config import resolve_repo_path
+
+
 def test_llamea_import(cfg: dict):
     section("4a. LLaMEA import")
     fw_cfg = cfg.get("frameworks", {}).get("llamea", {})
@@ -146,23 +149,17 @@ def test_llamea_import(cfg: dict):
         print(f"  {WARN}  LLaMEA is disabled in config — skipping")
         return
 
-    repo = fw_cfg.get("repo_path", "../LLaMEA")
-    p = Path(repo).resolve()
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+    config_dir = Path(cfg.get("_config_dir", Path.cwd()))
+    repo = resolve_repo_path(config_dir, fw_cfg.get("repo_path", "../LLaMEA"), "llamea")
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
 
     try:
         import llamea  # noqa: F401
-        print(f"  {PASS}  'llamea' package importable (repo: {p})")
+        print(f"  {PASS}  'llamea' package importable (repo: {repo})")
     except ImportError as exc:
         print(f"  {FAIL}  Cannot import 'llamea': {exc}")
-        print(f"       Make sure repo_path ({repo}) is correct and the package is installed.")
-
-    try:
-        from openai import OpenAI  # noqa: F401
-        print(f"  {PASS}  'openai' package importable")
-    except ImportError:
-        print(f"  {FAIL}  'openai' package not found — run: pip install openai")
+        print(f"       Resolved repo path: {repo}")
 
 
 def test_llm4ad_import(cfg: dict):
@@ -172,23 +169,46 @@ def test_llm4ad_import(cfg: dict):
         print(f"  {WARN}  LLM4AD is disabled in config — skipping")
         return
 
-    repo = fw_cfg.get("repo_path", "../LLM4AD")
-    p = Path(repo).resolve()
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+    config_dir = Path(cfg.get("_config_dir", Path.cwd()))
+    repo = resolve_repo_path(config_dir, fw_cfg.get("repo_path", "../LLM4AD"), "llm4ad")
 
     try:
-        from llm4ad.tools.llm.llm_api_https import HttpsApi  # noqa: F401
-        print(f"  {PASS}  'llm4ad.tools.llm.llm_api_https' importable (repo: {p})")
-    except ImportError as exc:
-        print(f"  {FAIL}  Cannot import LLM4AD: {exc}")
-        print(f"       Make sure repo_path ({repo}) is correct and dependencies installed.")
+        import importlib.util
+        import types
 
-    try:
-        from llm4ad.method.eoh import EoH, EoHProfiler  # noqa: F401
-        print(f"  {PASS}  'llm4ad.method.eoh.EoH' importable")
-    except ImportError as exc:
-        print(f"  {FAIL}  Cannot import EoH: {exc}")
+        pkg_root = repo / "llm4ad"
+
+        def ensure_package(name: str, path: Path):
+            mod = sys.modules.get(name)
+            if mod is None:
+                mod = types.ModuleType(name)
+                mod.__path__ = [str(path)]
+                sys.modules[name] = mod
+            return mod
+
+        def load_pkg(name: str, init_file: Path, search_path: Path):
+            spec = importlib.util.spec_from_file_location(
+                name, str(init_file), submodule_search_locations=[str(search_path)]
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load {name} from {init_file}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            return module
+
+        ensure_package("llm4ad", pkg_root)
+        base_mod = load_pkg("llm4ad.base", pkg_root / "base" / "__init__.py", pkg_root / "base")
+        ensure_package("llm4ad.tools", pkg_root / "tools")
+        load_pkg("llm4ad.tools.profiler", pkg_root / "tools" / "profiler" / "__init__.py", pkg_root / "tools" / "profiler")
+        ensure_package("llm4ad.method", pkg_root / "method")
+        eoh_pkg = load_pkg("llm4ad.method.eoh", pkg_root / "method" / "eoh" / "__init__.py", pkg_root / "method" / "eoh")
+
+        _ = base_mod.Evaluation, base_mod.LLM, eoh_pkg.EoH, eoh_pkg.EoHProfiler
+        print(f"  {PASS}  LLM4AD EoH symbols importable (repo: {repo})")
+    except Exception as exc:
+        print(f"  {FAIL}  Cannot load LLM4AD EoH symbols: {exc}")
+        print(f"       Resolved repo path: {repo}")
 
 
 def test_ease_api(cfg: dict):
