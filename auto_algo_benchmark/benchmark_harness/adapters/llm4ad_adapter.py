@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import sys
 import time
 import traceback
@@ -177,31 +178,42 @@ class LLM4ADAdapter(BaseAdapter):
                 temperature=float(cfg.get("temperature", 0.7)),
             )
             evaluation = _ContinuousEvaluation()
-            log_dir = Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results")) / "llm4ad_logs" / task.name / f"seed{seed}"
-            profiler = EoHProfiler(log_dir=str(log_dir), log_style="simple")
+            attempts = int(cfg.get("attempts", 2))
+            last_log_dir = None
+            last_best_value = None
+            for attempt in range(1, attempts + 1):
+                log_dir = Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results")) / "llm4ad_logs" / task.name / f"seed{seed}" / f"attempt{attempt}"
+                last_log_dir = log_dir
+                profiler = EoHProfiler(log_dir=str(log_dir), log_style="simple")
 
-            method = EoH(
-                llm=llm,
-                evaluation=evaluation,
-                profiler=profiler,
-                max_sample_nums=int(cfg.get("max_sample_nums", 24)),
-                max_generations=int(cfg.get("max_generations", 12)),
-                pop_size=int(cfg.get("pop_size", 6)),
-                selection_num=int(cfg.get("selection_num", 3)),
-                num_samplers=int(cfg.get("num_samplers", 1)),
-                num_evaluators=int(cfg.get("num_evaluators", 1)),
-                debug_mode=bool(cfg.get("debug_mode", False)),
-                multi_thread_or_process_eval=cfg.get("multi_thread_or_process_eval", "thread"),
-            )
+                method = EoH(
+                    llm=llm,
+                    evaluation=evaluation,
+                    profiler=profiler,
+                    max_sample_nums=int(cfg.get("max_sample_nums", 24)),
+                    max_generations=int(cfg.get("max_generations", 12)),
+                    pop_size=int(cfg.get("pop_size", 6)),
+                    selection_num=int(cfg.get("selection_num", 3)),
+                    num_samplers=int(cfg.get("num_samplers", 1)),
+                    num_evaluators=int(cfg.get("num_evaluators", 1)),
+                    debug_mode=bool(cfg.get("debug_mode", False)),
+                    multi_thread_or_process_eval=cfg.get("multi_thread_or_process_eval", "thread"),
+                )
 
-            method.run()
-            best_value = _extract_best_from_profiler(log_dir)
-            if best_value is None or best_value >= PENALTY_OBJECTIVE:
-                raise RuntimeError("LLM4AD finished without a valid best score.")
+                method.run()
+                best_value = _extract_best_from_profiler(log_dir)
+                last_best_value = best_value
+                if best_value is not None and best_value < PENALTY_OBJECTIVE:
+                    result["best_value"] = best_value
+                    result["success"] = True
+                    result["extra"] = {"log_dir": str(log_dir), "attempt": attempt}
+                    break
 
-            result["best_value"] = best_value
-            result["success"] = True
-            result["extra"] = {"log_dir": str(log_dir)}
+            if not result["success"]:
+                raise RuntimeError(
+                    f"LLM4AD finished without a valid best score after {attempts} attempt(s). "
+                    f"Last best={last_best_value!r}. Last log_dir={last_log_dir}"
+                )
 
         except ImportError as exc:
             msg = (
