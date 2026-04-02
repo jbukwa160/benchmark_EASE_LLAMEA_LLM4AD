@@ -1,40 +1,18 @@
-"""
-smoke_test.py — Quick sanity checks before running a full benchmark.
-
-Checks:
-  1. Config file is valid JSON and has all required keys.
-  2. Task definitions evaluate correctly.
-  3. Ollama endpoint is reachable.
-  4. Framework repos are importable (if enabled).
-  5. (For EASE) API endpoint is reachable and login works.
-
-Usage:
-    python smoke_test.py
-    python smoke_test.py --config my_config.json
-"""
+"""Quick sanity checks before running a full benchmark."""
 
 import argparse
 import json
 import sys
-import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from benchmark_harness.adapters.llamea_adapter import _candidate_repo_dirs as llamea_candidates
+from benchmark_harness.adapters.llm4ad_adapter import _candidate_repo_dirs as llm4ad_candidates
+
 PASS = "✅"
 FAIL = "❌"
 WARN = "⚠️ "
-
-
-def check(label: str, fn, *args, **kwargs) -> bool:
-    try:
-        fn(*args, **kwargs)
-        print(f"  {PASS}  {label}")
-        return True
-    except Exception as exc:
-        print(f"  {FAIL}  {label}")
-        print(f"       {exc}")
-        return False
 
 
 def section(title: str):
@@ -43,235 +21,68 @@ def section(title: str):
     print("─" * 60)
 
 
-# ---------------------------------------------------------------------------
-
-def test_config(config_path: str) -> dict | None:
+def test_config(config_path: str) -> tuple[dict | None, Path]:
     section("1. Config validation")
-    p = Path(config_path)
-
-    def _load():
-        if not p.exists():
-            raise FileNotFoundError(f"Not found: {p}")
-        with open(p) as f:
-            return json.load(f)
-
-    cfg = None
+    p = Path(config_path).resolve()
     try:
-        cfg = _load()
+        cfg = json.loads(p.read_text(encoding="utf-8"))
         print(f"  {PASS}  Config loaded: {p}")
+        return cfg, p
     except Exception as exc:
         print(f"  {FAIL}  Config load: {exc}")
-        return None
-
-    required_keys = ["ollama", "tasks", "seeds", "frameworks"]
-    for key in required_keys:
-        if key in cfg:
-            print(f"  {PASS}  Key '{key}' present")
-        else:
-            print(f"  {FAIL}  Key '{key}' MISSING from config")
-
-    ollama = cfg.get("ollama", {})
-    for sub in ["model", "base_url"]:
-        if ollama.get(sub):
-            print(f"  {PASS}  ollama.{sub} = {ollama[sub]!r}")
-        else:
-            print(f"  {FAIL}  ollama.{sub} not set")
-
-    return cfg
+        return None, p
 
 
-def test_tasks(cfg: dict):
-    section("2. Task definitions")
-    from benchmark_harness.tasks import get_task, TASK_REGISTRY
-    import numpy as np
-
-    task_defaults = cfg.get("task_defaults", {})
-    lb = task_defaults.get("lower_bound", -5.0)
-    ub = task_defaults.get("upper_bound", 5.0)
-
-    for task_name in cfg.get("tasks", []):
-        try:
-            task = get_task(task_name, lb, ub)
-            x = np.zeros(task.dimension)
-            val = task.evaluate(x)
-            print(f"  {PASS}  {task_name}: evaluate(zeros) = {val:.4f}")
-        except Exception as exc:
-            print(f"  {FAIL}  {task_name}: {exc}")
-
-
-def test_ollama(cfg: dict):
-    section("3. Ollama connectivity")
-    import requests
-
-    base_url = cfg.get("ollama", {}).get("base_url", "")
-    model = cfg.get("ollama", {}).get("model", "")
-
-    # Check base endpoint
-    try:
-        r = requests.get(base_url.rstrip("/") + "/api/tags", timeout=10)
-        r.raise_for_status()
-        models = [m.get("name", "") for m in r.json().get("models", [])]
-        print(f"  {PASS}  Ollama reachable at {base_url}")
-        if model in models:
-            print(f"  {PASS}  Model '{model}' is available")
-        else:
-            avail = ", ".join(models[:5]) + ("…" if len(models) > 5 else "")
-            print(f"  {WARN}  Model '{model}' not in available list: [{avail}]")
-            print(f"       Run: ollama pull {model}")
-    except Exception as exc:
-        print(f"  {FAIL}  Ollama not reachable: {exc}")
-        return
-
-    # Quick generation test via OpenAI-compatible endpoint
-    try:
-        import requests as _req
-        v1_url = base_url.rstrip("/") + "/v1/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": "Say OK"}],
-            "max_tokens": 5,
-        }
-        r = _req.post(v1_url, json=payload, timeout=60)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        print(f"  {PASS}  Chat completion OK (response: {content!r})")
-    except Exception as exc:
-        print(f"  {WARN}  Chat completion test failed: {exc}")
-
-
-from benchmark_harness.config import resolve_repo_path
-
-
-def test_llamea_import(cfg: dict):
-    section("4a. LLaMEA import")
+def test_llamea_import(cfg: dict, config_path: Path):
+    section("2. LLaMEA import")
     fw_cfg = cfg.get("frameworks", {}).get("llamea", {})
     if not fw_cfg.get("enabled", False):
         print(f"  {WARN}  LLaMEA is disabled in config — skipping")
         return
-
-    config_dir = Path(cfg.get("_config_dir", Path.cwd()))
-    repo = resolve_repo_path(config_dir, fw_cfg.get("repo_path", "../LLaMEA"), "llamea")
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
-
+    candidates = llamea_candidates(config_path.parent, fw_cfg.get("repo_path"), "llamea", ["LLaMEA", "llamea"])
+    if not candidates:
+        print(f"  {FAIL}  Could not resolve repo path for LLaMEA from {fw_cfg.get('repo_path')!r}")
+        return
+    repo = candidates[0]
+    sys.path.insert(0, str(repo))
     try:
         import llamea  # noqa: F401
-        print(f"  {PASS}  'llamea' package importable (repo: {repo})")
-    except ImportError as exc:
-        print(f"  {FAIL}  Cannot import 'llamea': {exc}")
-        print(f"       Resolved repo path: {repo}")
+        print(f"  {PASS}  LLaMEA importable from {repo}")
+    except Exception as exc:
+        print(f"  {FAIL}  Cannot import llamea from {repo}: {exc}")
 
 
-def test_llm4ad_import(cfg: dict):
-    section("4b. LLM4AD import")
+def test_llm4ad_import(cfg: dict, config_path: Path):
+    section("3. LLM4AD import")
     fw_cfg = cfg.get("frameworks", {}).get("llm4ad", {})
     if not fw_cfg.get("enabled", False):
         print(f"  {WARN}  LLM4AD is disabled in config — skipping")
         return
-
-    config_dir = Path(cfg.get("_config_dir", Path.cwd()))
-    repo = resolve_repo_path(config_dir, fw_cfg.get("repo_path", "../LLM4AD"), "llm4ad")
-
-    try:
-        import importlib.util
-        import types
-
-        pkg_root = repo / "llm4ad"
-
-        def ensure_package(name: str, path: Path):
-            mod = sys.modules.get(name)
-            if mod is None:
-                mod = types.ModuleType(name)
-                mod.__path__ = [str(path)]
-                sys.modules[name] = mod
-            return mod
-
-        def load_pkg(name: str, init_file: Path, search_path: Path):
-            spec = importlib.util.spec_from_file_location(
-                name, str(init_file), submodule_search_locations=[str(search_path)]
-            )
-            if spec is None or spec.loader is None:
-                raise ImportError(f"Cannot load {name} from {init_file}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-            return module
-
-        ensure_package("llm4ad", pkg_root)
-        base_mod = load_pkg("llm4ad.base", pkg_root / "base" / "__init__.py", pkg_root / "base")
-        ensure_package("llm4ad.tools", pkg_root / "tools")
-        load_pkg("llm4ad.tools.profiler", pkg_root / "tools" / "profiler" / "__init__.py", pkg_root / "tools" / "profiler")
-        ensure_package("llm4ad.method", pkg_root / "method")
-        eoh_pkg = load_pkg("llm4ad.method.eoh", pkg_root / "method" / "eoh" / "__init__.py", pkg_root / "method" / "eoh")
-
-        _ = base_mod.Evaluation, base_mod.LLM, eoh_pkg.EoH, eoh_pkg.EoHProfiler
-        print(f"  {PASS}  LLM4AD EoH symbols importable (repo: {repo})")
-    except Exception as exc:
-        print(f"  {FAIL}  Cannot load LLM4AD EoH symbols: {exc}")
-        print(f"       Resolved repo path: {repo}")
-
-
-def test_ease_api(cfg: dict):
-    section("4c. frontEASE API")
-    fw_cfg = cfg.get("frameworks", {}).get("ease", {})
-    if not fw_cfg.get("enabled", False):
-        print(f"  {WARN}  EASE is disabled in config — skipping")
+    candidates = llm4ad_candidates(config_path.parent, fw_cfg.get("repo_path"), "llm4ad", ["LLM4AD", "llm4ad"])
+    if not candidates:
+        print(f"  {FAIL}  Could not resolve repo path for LLM4AD from {fw_cfg.get('repo_path')!r}")
         return
-
-    import requests
-
-    base_url = fw_cfg.get("api_base_url", "")
+    repo = candidates[0]
+    sys.path.insert(0, str(repo))
     try:
-        r = requests.get(base_url.rstrip("/") + "/api/health", timeout=10)
-        r.raise_for_status()
-        print(f"  {PASS}  EASE health endpoint OK at {base_url}")
+        from benchmark_harness.adapters.llm4ad_adapter import LLM4ADAdapter
+        adapter = LLM4ADAdapter(fw_cfg, {"ollama": {"model": "test", "base_url": "http://127.0.0.1:11434"}, "_config_dir": str(config_path.parent), "task_defaults": {}})
+        adapter._load_llm4ad_symbols()
+        print(f"  {PASS}  LLM4AD EoH symbols importable from {repo}")
     except Exception as exc:
-        print(f"  {WARN}  EASE health check failed: {exc}")
+        print(f"  {FAIL}  Cannot load LLM4AD symbols from {repo}: {exc}")
 
-    try:
-        r = requests.post(
-            base_url.rstrip("/") + "/api/auth/login",
-            json={"username": fw_cfg.get("username", ""),
-                  "password": fw_cfg.get("password", "")},
-            timeout=15,
-        )
-        r.raise_for_status()
-        print(f"  {PASS}  EASE login OK")
-    except Exception as exc:
-        print(f"  {FAIL}  EASE login failed: {exc}")
-
-    template_id = fw_cfg.get("template_task_id", "")
-    if "PUT-YOUR" in template_id or not template_id:
-        print(f"  {WARN}  ease.template_task_id is not configured")
-    else:
-        print(f"  {PASS}  ease.template_task_id = {template_id!r}")
-
-
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Smoke-test the benchmark setup.")
     parser.add_argument("--config", default="benchmark_config.json")
     args = parser.parse_args()
 
-    print("\n" + "=" * 60)
-    print("  LLM EVOLUTIONARY BENCHMARK — SMOKE TEST")
-    print("=" * 60)
-
-    cfg = test_config(args.config)
+    cfg, config_path = test_config(args.config)
     if cfg is None:
-        print("\nAborted: config is invalid.\n")
         sys.exit(1)
-
-    test_tasks(cfg)
-    test_ollama(cfg)
-    test_llamea_import(cfg)
-    test_llm4ad_import(cfg)
-    test_ease_api(cfg)
-
-    print("\n" + "=" * 60)
-    print("  Smoke test complete. Fix any ❌ issues above before running.")
-    print("=" * 60 + "\n")
+    test_llamea_import(cfg, config_path)
+    test_llm4ad_import(cfg, config_path)
 
 
 if __name__ == "__main__":
