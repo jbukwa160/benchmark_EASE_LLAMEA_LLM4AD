@@ -24,6 +24,7 @@ from benchmark_harness.utils import (
     child_creation_kwargs,
     compute_stats,
     get_logger,
+    prepare_output_dir,
     terminate_process_tree,
     timestamp,
 )
@@ -176,7 +177,7 @@ def _run_isolated_experiment(
         import subprocess
 
         proc = subprocess.Popen(
-            [sys.executable, str(script_path), "--worker-json", str(payload_path)],
+            [sys.executable, "-u", str(script_path), "--worker-json", str(payload_path)],
             stdout=log_file,
             stderr=subprocess.STDOUT,
             cwd=str(script_path.parent),
@@ -248,6 +249,7 @@ def main() -> int:
     cfg["_config_dir"] = str(config_path.parent)
 
     output_dir = resolve_path(config_path.parent, cfg.get("output_dir", "../benchmark_results"))
+    output_dir = prepare_output_dir(output_dir, append=bool(cfg.get("append_results", False)))
     cfg["_output_dir_resolved"] = str(output_dir)
 
     runner_cfg = cfg.get("runner", {})

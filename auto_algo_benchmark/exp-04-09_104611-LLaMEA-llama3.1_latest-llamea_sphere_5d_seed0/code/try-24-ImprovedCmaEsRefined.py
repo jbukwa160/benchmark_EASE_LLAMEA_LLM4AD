@@ -1,0 +1,43 @@
+import numpy as np
+
+class ImprovedCmaEsRefined:
+    def __init__(self, budget=10000, dim=10):
+        self.budget = int(budget)
+        self.dim = dim
+        self.f_opt = np.inf
+        self.x_opt = None
+        self.mu = 0.5 ** (1 / dim) * np.random.uniform(-1, 1, size=(dim,))
+        self.sigma = 0.1
+        self.cov = np.eye(dim)
+        self.step_size = 0.01
+        self.learning_rate = 0.95
+        self.projected_mu = self.mu.copy()
+
+    def __call__(self, func):
+        for i in range(self.budget):
+            x = np.clip(np.random.multivariate_normal(self.mu, self.sigma * (np.eye(self.dim) + self.cov)), -5.0, 5.0)
+            # Project candidate solution onto feasible set
+            x_projected = np.maximum(-5.0, np.minimum(x, 5.0))
+            f = func(x_projected)
+            if f < self.f_opt:
+                self.f_opt = f
+                self.x_opt = x_projected
+            # Adaptive step-size update with learning rate schedule
+            self.step_size *= np.exp((1 - (f / self.f_opt)) * self.learning_rate ** i)
+            self.cov = (1 - 2 / (self.budget + 1)) * self.cov + (1 / (self.budget + 1)) * np.outer((x_projected - self.mu), (x_projected - self.mu))
+            # Adaptive covariance matrix diagonal
+            self.cov[range(self.dim), range(self.dim)] = np.maximum(self.cov[range(self.dim), range(self.dim)], 0.01)
+            # Project updated mean onto feasible set
+            self.projected_mu = np.maximum(-5.0, np.minimum(x_projected, 5.0))
+
+        return self.f_opt, self.x_opt
+
+def algorithm(func, dim, lb, ub, budget, rng):
+    es = ImprovedCmaEsRefined(budget=budget, dim=dim)
+    return es(func)
+
+# Example usage:
+def sphere(x):
+    return np.sum(np.square(x))
+
+print(algorithm(sphere, 5, -5.0, 5.0, 10000, None))
