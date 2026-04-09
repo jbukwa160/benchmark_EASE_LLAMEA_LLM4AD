@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import socket
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -33,8 +35,25 @@ def test_config(config_path: str) -> tuple[dict | None, Path]:
         return None, p
 
 
+
+
+def test_ollama_endpoint(cfg: dict):
+    section("2. Ollama endpoint")
+    base_url = cfg.get("ollama", {}).get("base_url", "")
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if not host:
+        print(f"  {FAIL}  Invalid Ollama base_url: {base_url!r}")
+        return
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            print(f"  {PASS}  TCP connection to Ollama endpoint works: {host}:{port}")
+    except Exception as exc:
+        print(f"  {FAIL}  Cannot reach Ollama endpoint {host}:{port}: {exc}")
+
 def test_llamea_import(cfg: dict, config_path: Path):
-    section("2. LLaMEA import")
+    section("3. LLaMEA import")
     fw_cfg = cfg.get("frameworks", {}).get("llamea", {})
     if not fw_cfg.get("enabled", False):
         print(f"  {WARN}  LLaMEA is disabled in config — skipping")
@@ -53,7 +72,7 @@ def test_llamea_import(cfg: dict, config_path: Path):
 
 
 def test_llm4ad_import(cfg: dict, config_path: Path):
-    section("3. LLM4AD import")
+    section("4. LLM4AD import")
     fw_cfg = cfg.get("frameworks", {}).get("llm4ad", {})
     if not fw_cfg.get("enabled", False):
         print(f"  {WARN}  LLM4AD is disabled in config — skipping")
@@ -81,6 +100,7 @@ def main():
     cfg, config_path = test_config(args.config)
     if cfg is None:
         sys.exit(1)
+    test_ollama_endpoint(cfg)
     test_llamea_import(cfg, config_path)
     test_llm4ad_import(cfg, config_path)
 

@@ -245,12 +245,13 @@ class LLM4ADAdapter(BaseAdapter):
             attempts = int(cfg.get("attempts", 2))
             last_log_dir = None
             last_best_value = None
+            last_error = None
 
             for attempt in range(1, attempts + 1):
-                log_dir = Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results")) / "llm4ad_logs" / task.name / f"seed{seed}"
-                if log_dir.exists():
-                    import shutil
-                    shutil.rmtree(log_dir, ignore_errors=True)
+                log_dir = (
+                    Path(self.global_cfg.get("_output_dir_resolved", "benchmark_results"))
+                    / "llm4ad_logs" / task.name / f"seed{seed}" / f"attempt{attempt}"
+                )
                 log_dir.mkdir(parents=True, exist_ok=True)
                 last_log_dir = log_dir
 
@@ -273,6 +274,8 @@ class LLM4ADAdapter(BaseAdapter):
                 method.run()
                 best_value = self._extract_best_from_profiler(log_dir)
                 last_best_value = best_value
+                if best_value is None:
+                    last_error = f"No usable score parsed from profiler output in {log_dir}"
 
                 if best_value is not None and math.isfinite(best_value) and best_value < PENALTY_OBJECTIVE:
                     result["best_value"] = best_value
@@ -288,7 +291,8 @@ class LLM4ADAdapter(BaseAdapter):
                 else:
                     result["error"] = (
                         f"LLM4AD finished without a usable best score after {attempts} attempt(s). "
-                        f"last_best={last_best_value!r} log_dir={last_log_dir}"
+                        f"last_best={last_best_value!r} log_dir={last_log_dir}. "
+                        f"last_error={last_error}"
                     )
 
         except Exception:
@@ -302,16 +306,35 @@ class LLM4ADAdapter(BaseAdapter):
     @staticmethod
     def _extract_best_from_profiler(log_dir: Path) -> float | None:
         candidates: list[float] = []
-        best_json = log_dir / "samples" / "samples_best.json"
-        if best_json.exists():
+
+        sample_dir = log_dir / "samples"
+        if sample_dir.exists():
+            for path in sorted(sample_dir.glob("samples*.json")):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    score = item.get("score") if isinstance(item, dict) else None
+                    try:
+                        score_f = float(score)
+                    except Exception:
+                        continue
+                    if math.isfinite(score_f):
+                        candidates.append(float(-score_f))
+
+        txt_log = log_dir / "log.txt"
+        if txt_log.exists():
+            pattern = re.compile(r"Cur_Best_Score\s*=\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)")
             try:
-                data = json.loads(best_json.read_text(encoding="utf-8"))
-                for item in data if isinstance(data, list) else [data]:
-                    score = item.get("score")
-                    if score is not None and math.isfinite(float(score)):
-                        candidates.append(float(-float(score)))
+                for match in pattern.finditer(txt_log.read_text(encoding="utf-8", errors="ignore")):
+                    score_f = float(match.group(1))
+                    if math.isfinite(score_f):
+                        candidates.append(float(-score_f))
             except Exception:
                 pass
+
         if candidates:
             return min(candidates)
         return None

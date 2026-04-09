@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -402,6 +403,28 @@ def evaluate_candidate_code(
     feedback = str(data.get("message") or f"mean_obj={mean_objective:.6f}")
     error = None if mean_objective < PENALTY_OBJECTIVE else feedback
     return mean_objective, feedback, error
+
+
+# ---------------------------------------------------------------------------
+# Output-dir helpers
+# ---------------------------------------------------------------------------
+
+def prepare_output_dir(output_dir: str | Path, append: bool = False) -> Path:
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    if append:
+        return path
+
+    for child in path.iterdir():
+        name = child.name
+        try:
+            if child.is_dir() and name in {"logs", "_tmp", "llm4ad_logs"}:
+                shutil.rmtree(child, ignore_errors=True)
+            elif child.is_file() and (name.endswith(".jsonl") or name == "heartbeat.json"):
+                child.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return path
 
 
 # ---------------------------------------------------------------------------
