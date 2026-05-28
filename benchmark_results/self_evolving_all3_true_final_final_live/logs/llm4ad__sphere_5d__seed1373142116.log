@@ -1,0 +1,418 @@
+====================================================================
+LLM Parameters
+--------------------------------------------------------------------
+  - LLM: _HTTPModel
+  - do_auto_trim: False
+  - debug_mode: False
+  - model: llama3.1:8b
+====================================================================
+Problem Parameters
+--------------------------------------------------------------------
+  - Problem: _ContinuousEvaluation
+  - task_description: Task: Minimise the 5-dimensional Sphere function: f(x) = sum(x_i^2). All variables are bounded in [-5.0, 5.0]. The global minimum is 0 at x = (0, 0, 0, 0, 0).
+
+Write a single sequential Python function only. No threads, multiprocessing, subprocesses, files, networking, eval, exec, or non-numpy imports.
+
+Return Python code only. Implement:
+def algorithm(func, dim, lb, ub, budget, rng):
+    ...
+The function must return the best 1-D numpy array found.
+Clip candidates to [lb, ub].
+
+  - use_numba_accelerate: False
+  - use_protected_div: False
+  - protected_div_delta: 1e-05
+  - random_seed: None
+  - timeout_seconds: None
+  - exec_code: False
+  - safe_evaluate: False
+  - daemon_eval_process: False
+  - fork_proc: auto
+====================================================================
+Method Parameters
+--------------------------------------------------------------------
+  - Method: EoH
+  - _max_generations: 4
+  - _max_sample_nums: 8
+  - _pop_size: 6
+  - _selection_num: 3
+  - _use_e2_operator: True
+  - _use_m1_operator: True
+  - _use_m2_operator: True
+  - _num_samplers: 1
+  - _num_evaluators: 1
+  - _resume_mode: False
+  - _debug_mode: False
+  - _multi_thread_or_process_eval: thread
+  - _function_to_evolve_name: algorithm
+  - _tot_sample_nums: 0
+  - _initial_sample_nums_max: 8
+  - _evaluation_executor: <concurrent.futures.thread.ThreadPoolExecutor object at 0x0000024D56D3FD40>
+=====================================================================
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    bounds = [(lb[i], ub[i]) for i in range(dim)]
+    best_x = np.random.uniform(bounds[0][0], bounds[0][1], size=(dim,))
+    best_f = float('inf')
+    
+    num_samples = 0
+    while True:
+        if num_samples >= budget:
+            break
+        
+        x = np.clip(best_x + rng.normal(size=best_x.shape), *bounds)
+        
+        f = func(x)
+        
+        if f < best_f:
+            best_f = f
+            best_x = x
+        
+        num_samples += 1
+    
+    return best_x
+------------------------------------------------------
+Score        : None
+Sample time  : 22.108168601989746
+Evaluate time: 0.2150430679321289
+Sample orders: 1
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    n = dim
+    x_best = np.random.uniform(lb, ub, (1, n))
+    lambda_ = 2 + int(np.log(budget / 1000))
+    mu = lambda_ // 5
+    sigma = np.sqrt(n)
+    c_c = 1.0
+    cc = 1.4
+    cmu = 1.0
+    damps = 1e-4
+    x_mean = np.zeros((n,))
+
+    for i in range(1, budget + 1):
+        x = rng.normal(loc=x_best, scale=sigma, size=(lambda_, n))
+        for j in range(lambda_ - 1):
+            u = rng.uniform(size=n)
+            if u < c_c:
+                x[j] = x[j] + cc * (x[j+1] - x_mean)
+
+        f_x = np.array([func(x_) for x_ in x])
+        p_f = np.sum(f_x) / lambda_
+        f_x_best = func(x_best)
+        p_f_best = f_x_best
+
+        if p_f < p_f_best:
+            x_best = x[np.argmin(f_x)]
+            p_f_best = p_f
+            sigma *= 1 + 1/(4+lambda_/dim)*np.sqrt(2*np.log(lambda_*dim/p_f_best))
+            cc = np.min([cc * np.exp(-damps*(p_f_best - p_f)), (1.4 - 1) / i])
+
+        if rng.uniform() < cmu:
+            sigma *= 0.5
+
+    return x_best
+------------------------------------------------------
+Score        : None
+Sample time  : 46.42505121231079
+Evaluate time: 0.21278142929077148
+Sample orders: 2
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(candidate):
+        return np.minimum(np.maximum(candidate, lb), ub)
+
+    def sphere(x):
+        return sum(i**2 for i in x)
+
+    def differential_evolution(bounds, popsize=50, maxiter=1000, crossover_prob=0.7, mutation_prob=0.1, seed=None):
+        if seed is not None:
+            rng = np.random.default_rng(seed)
+        else:
+            rng = rng
+
+        bounds = [(lb[i], ub[i]) for i in range(dim)]
+
+        pop = rng.uniform(0, 1, (popsize, dim))
+        pop = [clip(np.array([bounds[i][0] + bound * (bounds[i][1] - bounds[i][0]) for i, bound in enumerate(ind)])) for ind in pop]
+
+        for _ in range(maxiter):
+            new_pop = []
+            for i in range(popsize):
+                other_i = rng.choice(range(popsize), size=3, replace=False)
+                if rng.uniform(0, 1) < crossover_prob:
+                    child = pop[other_i[0]] + mutation_prob * (pop[other_i[1]] - pop[other_i[2]])
+                    new_pop.append(clip(child))
+                else:
+                    new_pop.append(pop[i])
+            pop = new_pop
+
+        return min(pop, key=sphere)
+
+    def simulated_annealing(bounds, popsize=50, maxiter=1000, temperature_init=1e-6, cooling_rate=0.9999):
+        bounds = [(lb[i], ub[i]) for i in range(dim)]
+
+        pop = rng.uniform(0, 1, (popsize, dim))
+        pop = [clip(np.array([bounds[i][0] + bound * (bounds[i][1] - bounds[i][0]) for i, bound in enumerate(ind)])) for ind in pop]
+
+        temperature = temperature_init
+        best_solution = None
+
+        for _ in range(maxiter):
+            new_pop = []
+            for i in range(popsize):
+                other_i = rng.choice(range(popsize), size=3, replace=False)
+                if rng.uniform(0, 1) < 0.5:
+                    child = pop[other_i[0]] + temperature * (pop[other_i[1]] - pop[other_i[2]])
+                    new_pop.append(clip(child))
+                else:
+                    new_pop.append(pop[i])
+            pop = new_pop
+
+            candidate = min(pop, key=sphere)
+            if sphere(candidate) < sphere(best_solution):
+                best_solution = candidate
+            temperature *= cooling_rate
+
+        return best_solution
+
+    solution1 = differential_evolution((lb, ub))
+    solution2 = simulated_annealing((lb, ub))
+
+    if budget > 1000:
+        popsize = int(np.sqrt(budget / 10) * rng.uniform(5, 20))
+        maxiter = int(budget / 10)
+        temperature_init = 1e-6
+        cooling_rate = 0.9999
+
+        bounds = [(lb[i], ub[i]) for i in range(dim)]
+
+        pop = rng.uniform(0, 1, (popsize, dim))
+        pop = [clip(np.array([bounds[i][0] + bound * (bounds[i][1] - bounds[i][0]) for i, bound in enumerate(ind)])) for ind in pop]
+
+        temperature = temperature_init
+        best_solution = None
+
+        for _ in range(maxiter):
+            new_pop = []
+            for i in range(popsize):
+                other_i = rng.choice(range(popsize), size=3, replace=False)
+                if rng.uniform(0, 1) < crossover_prob:
+                    child = pop[other_i[0]] + mutation_prob * (pop[other_i[1]] - pop[other_i[2]])
+                    new_pop.append(clip(child))
+                else:
+                    new_pop.append(pop[i])
+            pop = new_pop
+
+            candidate = min(pop, key=sphere)
+            if sphere(candidate) < sphere(best_solution):
+                best_solution = candidate
+            temperature *= cooling_rate
+
+        return best_solution
+    elif budget > 500:
+        solution3 = differential_evolution((lb, ub), maxiter=int(budget / 5))
+        return min([solution1, solution2, solution3], key=sphere)
+    else:
+        return solution1 if sphere(solution1) < sphere(solution2) else solution2
+------------------------------------------------------
+Score        : None
+Sample time  : 108.26192784309387
+Evaluate time: 0.2240769863128662
+Sample orders: 3
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    sigma = 5.0
+    T = 100.0
+    n_iter = int(budget / (dim * rng))
+    x_best = np.random.uniform(lb, ub, size=dim)
+    f_best = func(x_best)
+
+    for _ in range(n_iter):
+        x_new = x_best + sigma * np.random.normal(size=dim)
+        x_new = np.clip(x_new, lb, ub)
+        
+        if rng < 1.0:
+            alpha = (ub - lb) / T
+            x_new = x_best + alpha * np.sign(np.random.uniform(-1, 1, size=dim)) * (x_new - x_best)
+            x_new = np.clip(x_new, lb, ub)
+
+        f_new = func(x_new)
+
+        if f_new < f_best:
+            x_best = x_new
+            f_best = f_new
+
+        sigma *= 0.99
+        T -= 1
+
+    return x_best
+------------------------------------------------------
+Score        : None
+Sample time  : 28.349331617355347
+Evaluate time: 0.20128512382507324
+Sample orders: 4
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    x = np.array([np.random.uniform(lb, ub) for _ in range(dim)])
+    r = (ub - lb) / 2
+    best_x = x.copy()
+    best_f = func(x)
+    
+    for i in range(budget):
+        # Generate new candidate
+        step_size = max(r * np.exp(-i / budget), 1e-6)
+        new_x = x + rng.choice([-1, 1], size=dim) * step_size
+        
+        # Clip to bounds
+        new_x = np.clip(new_x, lb, ub)
+        
+        # Evaluate function
+        new_f = func(new_x)
+        
+        if new_f < best_f:
+            best_x = new_x.copy()
+            best_f = new_f
+            
+        # Update radius
+        r *= 0.9
+        
+    return best_x
+------------------------------------------------------
+Score        : -18.79105487543965
+Sample time  : 27.934831380844116
+Evaluate time: 0.5663013458251953
+Sample orders: 5
+------------------------------------------------------
+Current best score: -18.79105487543965
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    n = len(rng)
+    assert dim == 5
+    assert n == budget
+    best_x = -np.inf * np.ones(dim)
+    
+    for i in range(n):
+        x = rng * (ub - lb) + lb
+        
+        # Clip candidates to [lb, ub]
+        clipped_x = np.clip(x, lb, ub)
+        
+        f_x = func(clipped_x)
+        
+        if f_x < best_x[-1]:
+            best_x = clipped_x
+    
+    return best_x
+------------------------------------------------------
+Score        : None
+Sample time  : 21.246244192123413
+Evaluate time: 0.19986486434936523
+Sample orders: 6
+------------------------------------------------------
+Current best score: -18.79105487543965
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    D = len(dim)
+    
+    # Initialize population and temperature
+    pop_size = int(budget / (D + 1))
+    population = np.random.uniform(lb, ub, size=(pop_size, D))
+    temp = 1.0
+    
+    # Main loop
+    while budget > 0:
+        for i in range(pop_size):
+            # Differential Evolution step
+            diff = population[np.random.choice(range(pop_size), replace=False, size=3)] - population[i]
+            new_candidate = population[i] + 0.5 * temp / np.mean(np.abs(diff)) * diff
+            
+            # Clip candidate to bounds
+            new_candidate = np.clip(new_candidate, lb, ub)
+            
+            # Simulated Annealing step
+            if func(new_candidate) < func(population[i]):
+                population[i] = new_candidate
+            else:
+                accept_prob = np.exp(-(func(new_candidate) - func(population[i])) / temp)
+                if rng.rand() < accept_prob:
+                    population[i] = new_candidate
+        
+        # Update temperature and budget
+        temp *= 0.99
+        budget -= D + 1
+    
+    return population[np.argmin([func(x) for x in population])]
+------------------------------------------------------
+Score        : None
+Sample time  : 35.91421961784363
+Evaluate time: 0.20621991157531738
+Sample orders: 7
+------------------------------------------------------
+Current best score: -18.79105487543965
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(candidates):
+        return np.clip(candidates, lb, ub)
+
+    def generate_candidate(current_solution):
+        noise = (ub - lb) * rng.random((dim)) + lb
+        new_solution = current_solution + noise
+        new_solution = clip(new_solution)
+        return new_solution
+
+    temperature = 1.0
+    best_solution = np.zeros(dim)
+    best_value = float('inf')
+
+    for _ in range(budget):
+        candidate = generate_candidate(best_solution)
+        value = func(candidate)
+
+        if value < best_value:
+            best_value = value
+            best_solution = candidate
+
+        delta = value - best_value
+        accept_probability = np.exp(-delta / temperature)
+        r = rng.random()
+
+        if r < accept_probability or delta <= 0.0:
+            current_solution = candidate
+
+        temperature *= 0.99
+
+    return clip(best_solution)
+------------------------------------------------------
+Score        : -2.4351398041609054
+Sample time  : 29.94485592842102
+Evaluate time: 0.38066744804382324
+Sample orders: 8
+------------------------------------------------------
+Current best score: -2.4351398041609054
+======================================================
+
+Note: During initialization, EoH gets 2 algorithms after 8 trails.
+The search is terminated since EoH unable to obtain 3 feasible algorithms during initialization. Please increase the `initial_sample_nums_max` argument (currently 8). Please also check your evaluation implementation and LLM implementation.
+{"framework": "llm4ad", "task": "sphere_5d", "seed": 1373142116, "best_value": 2.4351398041609054, "success": true, "error": null, "elapsed_sec": 322.645, "timestamp": "2026-05-19T11:35:06.533446Z", "extra": {"log_dir": "C:\\Users\\ailab\\Downloads\\LLM_Evolutionary_benchmarks\\LLM_Evolutionary_benchmarks\\benchmark_results\\self_evolving_all3_true_final_final_live\\llm4ad_logs\\sphere_5d\\seed1373142116\\attempt1", "attempt": 1, "repo_path": "C:\\Users\\ailab\\Downloads\\LLM_Evolutionary_benchmarks\\LLM_Evolutionary_benchmarks\\LLM4AD", "llm_call_count": 8, "configured_eval_upper_bound": 32, "budget_explanation": "max_sample_nums x max_generations x attempts is the configured upper-bound for candidate evaluations."}}

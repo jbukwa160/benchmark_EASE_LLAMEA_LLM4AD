@@ -1,0 +1,338 @@
+====================================================================
+LLM Parameters
+--------------------------------------------------------------------
+  - LLM: _HTTPModel
+  - do_auto_trim: False
+  - debug_mode: False
+  - model: llama3.1:8b
+====================================================================
+Problem Parameters
+--------------------------------------------------------------------
+  - Problem: _ContinuousEvaluation
+  - task_description: Task: Minimise the 5-dimensional Sphere function: f(x) = sum(x_i^2). All variables are bounded in [-5.0, 5.0]. The global minimum is 0 at x = (0, 0, 0, 0, 0).
+
+Write a single sequential Python function only. No threads, multiprocessing, subprocesses, files, networking, eval, exec, or non-numpy imports.
+
+Return Python code only. Implement:
+def algorithm(func, dim, lb, ub, budget, rng):
+    ...
+The function must return the best 1-D numpy array found.
+Clip candidates to [lb, ub].
+
+  - use_numba_accelerate: False
+  - use_protected_div: False
+  - protected_div_delta: 1e-05
+  - random_seed: None
+  - timeout_seconds: None
+  - exec_code: False
+  - safe_evaluate: False
+  - daemon_eval_process: False
+  - fork_proc: auto
+====================================================================
+Method Parameters
+--------------------------------------------------------------------
+  - Method: EoH
+  - _max_generations: 4
+  - _max_sample_nums: 8
+  - _pop_size: 6
+  - _selection_num: 3
+  - _use_e2_operator: True
+  - _use_m1_operator: True
+  - _use_m2_operator: True
+  - _num_samplers: 1
+  - _num_evaluators: 1
+  - _resume_mode: False
+  - _debug_mode: False
+  - _multi_thread_or_process_eval: thread
+  - _function_to_evolve_name: algorithm
+  - _tot_sample_nums: 0
+  - _initial_sample_nums_max: 8
+  - _evaluation_executor: <concurrent.futures.thread.ThreadPoolExecutor object at 0x000002351D07FD40>
+=====================================================================
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(x, lb, ub):
+        return np.minimum(np.maximum(x, lb), ub)
+
+    num_clusters = int(np.ceil(budget ** (1 / 3)))
+    clusters = [np.array([rng.uniform(lb, ub) for _ in range(dim)]) for _ in range(num_clusters)]
+    
+    for i in range(budget):
+        new_point = np.zeros(dim)
+        cluster_idx = rng.choice(num_clusters)
+        
+        # Sample a point within the current cluster
+        new_point = clusters[cluster_idx] + rng.uniform(-1, 1, size=dim) * (clusters[cluster_idx] - lb) / 5.0
+        
+        # Assign new_point to its closest cluster
+        min_dist = float('inf')
+        best_cluster_idx = None
+        for j, cluster in enumerate(clusters):
+            dist = np.linalg.norm(new_point - cluster)
+            if dist < min_dist:
+                min_dist = dist
+                best_cluster_idx = j
+        
+        # Expand or shrink the best cluster based on its centroid's function value
+        centroid = clusters[best_cluster_idx]
+        new_centroid = 2 * centroid - clusters[best_cluster_idx] + rng.uniform(-1, 1) * (centroid - lb)
+        
+        if i % 10 == 0:  # Expand around a promising cluster every 10 iterations
+            clusters[best_cluster_idx] = clip(new_centroid + rng.uniform(-1, 1, size=dim) * 2.5,
+                                               lb, ub)
+        else:
+            clusters[best_cluster_idx] = clip(centroid + rng.uniform(-1, 1, size=dim) * 0.5,
+                                                lb, ub)
+        
+        # Evaluate the function at all cluster centroids
+        scores = [func(cluster) for cluster in clusters]
+    
+    best_cluster_idx = np.argmin(scores)
+    return clip(clusters[best_cluster_idx], lb, ub)
+------------------------------------------------------
+Score        : -28.43886625609802
+Sample time  : 60.52872586250305
+Evaluate time: 1.6133668422698975
+Sample orders: 1
+------------------------------------------------------
+Current best score: -28.43886625609802
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    n = 20  # Population size
+    mu = 1 / n  # Step-size
+    sigma_max = 5.0  # Maximum standard deviation
+
+    def sample():
+        x = (ub - lb) * rng.uniform(size=dim) + lb
+        return x
+
+    x_best = np.zeros(dim)
+    f_best = float('inf')
+
+    for _ in range(budget):
+        y = [sample() for _ in range(n)]
+        mu_new = 0.01 * rng.normal(0, 1) + 1 / n
+
+        for i in range(n):
+            x = y[i] + np.sqrt(mu_new) * (ub - lb) * rng.normal(size=dim)
+            f_x = func(x)
+
+            if f_x < f_best:
+                f_best = f_x
+                x_best = x
+
+        mu = max(1e-4, min(mu_max, 0.01 * np.mean(np.abs(y)) + mu))
+
+    return np.clip(x_best, lb, ub)
+------------------------------------------------------
+Score        : None
+Sample time  : 32.31877827644348
+Evaluate time: 0.23165321350097656
+Sample orders: 2
+------------------------------------------------------
+Current best score: -28.43886625609802
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    num_restart = 10
+    pop_size = int(np.ceil(budget / num_restart))
+    
+    best_sol = None
+    best_val = float('inf')
+    
+    for _ in range(num_restart):
+        candidates = np.random.uniform(lb, ub, (pop_size, dim))
+        
+        vals = func(candidates)
+        idx = np.argsort(vals)[:1]
+        cand = candidates[idx[0]]
+        
+        if vals[idx[0]] < best_val:
+            best_sol = cand
+            best_val = vals[idx[0]]
+    
+    return best_sol
+------------------------------------------------------
+Score        : None
+Sample time  : 23.163529872894287
+Evaluate time: 0.22231411933898926
+Sample orders: 3
+------------------------------------------------------
+Current best score: -28.43886625609802
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    x = np.random.uniform(lb, ub, size=dim)
+    best_x = x.copy()
+    min_value = func(x)
+
+    for _ in range(budget):
+        new_x = x + rng.normal(size=dim) * 0.01
+        new_x = np.clip(new_x, lb, ub)
+        
+        if func(new_x) < min_value:
+            min_value = func(new_x)
+            best_x = new_x.copy()
+            
+        elif rng.uniform(0, 1) > np.exp((min_value - func(new_x)) / 100):
+            min_value = func(new_x)
+            best_x = new_x.copy()
+
+        x = best_x
+
+    return best_x
+------------------------------------------------------
+Score        : -1.4408094271158336
+Sample time  : 58.00972843170166
+Evaluate time: 0.43475937843322754
+Sample orders: 4
+------------------------------------------------------
+Current best score: -1.4408094271158336
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(x):
+        return np.clip(x, lb, ub)
+
+    x = np.random.uniform(lb, ub, size=(dim,))
+    best_x = x.copy()
+    best_y = func(x)
+    
+    for _ in range(budget):
+        y = func(clip(x + 0.1 * rng.normal(size=dim)))
+        
+        if y < best_y:
+            best_y = y
+            best_x = x.copy()
+            
+        alpha = np.exp(-_ / budget)
+        x = (1 - alpha) * clip(best_x) + alpha * clip(rng.normal(size=(dim,)))
+    
+    return best_x
+------------------------------------------------------
+Score        : -0.08517816015381043
+Sample time  : 19.25050401687622
+Evaluate time: 0.4841926097869873
+Sample orders: 5
+------------------------------------------------------
+Current best score: -0.08517816015381043
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    x = lb + (ub - lb) * rng.rand(dim)
+    for _ in range(budget):
+        step_size = 1 / (1 + _ / budget) * 0.5
+        direction = rng.randn(dim)
+        new_x = x + step_size * direction
+        new_x = np.clip(new_x, lb, ub)
+        if func(new_x) < func(x):
+            x = new_x
+    return x
+------------------------------------------------------
+Score        : None
+Sample time  : 18.430641412734985
+Evaluate time: 0.2234973907470703
+Sample orders: 6
+------------------------------------------------------
+Current best score: -0.08517816015381043
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(x):
+        return np.clip(x, lb, ub)
+
+    init_x = np.random.uniform(lb, ub, (dim,))
+    best_x = init_x.copy()
+
+    for i in range(budget):
+        x_dev1 = np.random.normal(0, 0.5, (dim,))
+        x_dev2 = np.random.normal(0, 0.5, (dim,))
+        x_dev3 = np.random.normal(0, 0.5, (dim,))
+
+        dev_x1 = clip(init_x + x_dev1)
+        dev_x2 = clip(best_x + x_dev2)
+        dev_x3 = clip(best_x + x_dev3)
+
+        candidates = np.vstack((init_x, dev_x1, dev_x2, dev_x3))
+        candidate_fitnesses = func(candidates)
+
+        if i == budget - 1:
+            best_candidate_idx = np.argmin(candidate_fitnesses)
+            best_candidate = candidates[best_candidate_idx]
+            if func(best_candidate) < func(best_x):
+                best_x = best_candidate
+
+        else:
+            idxs_to_replace = np.random.choice(4, size=3, replace=False)
+            new_candidates = candidates[idxs_to_replace]
+
+            for j in range(3):
+                new_candidates[j] += rng.uniform(-1, 1)
+
+            new_candidate_fitnesses = func(new_candidates)
+
+            if np.any(new_candidate_fitnesses < candidate_fitnesses[idxs_to_replace]):
+                idxs_to_replace = np.where(new_candidate_fitnesses < candidate_fitnesses[idxs_to_replace])[0]
+                candidates[idxs_to_replace] = new_candidates[idxs_to_replace]
+
+            best_candidate_idx = np.argmin(candidate_fitnesses)
+            best_candidate = candidates[best_candidate_idx]
+
+            if func(best_candidate) < func(best_x):
+                best_x = best_candidate
+
+    return best_x
+------------------------------------------------------
+Score        : None
+Sample time  : 42.61658596992493
+Evaluate time: 0.21232366561889648
+Sample orders: 7
+------------------------------------------------------
+Current best score: -0.08517816015381043
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    best_x = None
+    best_y = float('inf')
+    
+    learn_rate = 1.0
+    noise_std = 0.5
+    
+    for _ in range(budget // 10 + 1):
+        x = np.zeros(dim)
+        
+        for i in range(dim):
+            if rng.rand() < 0.2:  # 20% chance of restart
+                x[i] = lb + (ub - lb) * rng.rand()
+            else:
+                x[i] += learn_rate * (rng.randn() * noise_std)
+                x[i] = np.clip(x[i], lb, ub)
+        
+        y = func(x)
+        
+        if y < best_y:
+            best_y = y
+            best_x = x.copy()
+        
+        learn_rate *= 0.999
+        
+    return best_x
+------------------------------------------------------
+Score        : None
+Sample time  : 21.91003441810608
+Evaluate time: 0.20208311080932617
+Sample orders: 8
+------------------------------------------------------
+Current best score: -0.08517816015381043
+======================================================
+
+Note: During initialization, EoH gets 3 algorithms after 8 trails.
+{"framework": "llm4ad", "task": "sphere_5d", "seed": 1612579345, "best_value": 0.08517816015381043, "success": true, "error": null, "elapsed_sec": 280.069, "timestamp": "2026-05-25T20:32:16.059281Z", "extra": {"log_dir": "C:\\Users\\ailab\\Downloads\\LLM_Evolutionary_benchmarks\\LLM_Evolutionary_benchmarks\\benchmark_results\\self_evolving_all3_true_final_final_live\\llm4ad_logs\\sphere_5d\\seed1612579345\\attempt1", "attempt": 1, "repo_path": "C:\\Users\\ailab\\Downloads\\LLM_Evolutionary_benchmarks\\LLM_Evolutionary_benchmarks\\LLM4AD", "llm_call_count": 8, "configured_eval_upper_bound": 32, "budget_explanation": "max_sample_nums x max_generations x attempts is the configured upper-bound for candidate evaluations."}}
