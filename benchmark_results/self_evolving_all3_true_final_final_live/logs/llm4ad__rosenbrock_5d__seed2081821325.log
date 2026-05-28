@@ -1,0 +1,359 @@
+====================================================================
+LLM Parameters
+--------------------------------------------------------------------
+  - LLM: _HTTPModel
+  - do_auto_trim: False
+  - debug_mode: False
+  - model: llama3.1:8b
+====================================================================
+Problem Parameters
+--------------------------------------------------------------------
+  - Problem: _ContinuousEvaluation
+  - task_description: Task: Minimise the 5-dimensional Rosenbrock (banana) function: f(x) = sum(100*(x_{i+1}-x_i^2)^2 + (1-x_i)^2). All variables are bounded in [-5.0, 5.0]. The global minimum is 0 at x = (1, 1, 1, 1, 1).
+
+Write a single sequential Python function only. No threads, multiprocessing, subprocesses, files, networking, eval, exec, or non-numpy imports.
+
+Return Python code only. Implement:
+def algorithm(func, dim, lb, ub, budget, rng):
+    ...
+The function must return the best 1-D numpy array found.
+Clip candidates to [lb, ub].
+
+  - use_numba_accelerate: False
+  - use_protected_div: False
+  - protected_div_delta: 1e-05
+  - random_seed: None
+  - timeout_seconds: None
+  - exec_code: False
+  - safe_evaluate: False
+  - daemon_eval_process: False
+  - fork_proc: auto
+====================================================================
+Method Parameters
+--------------------------------------------------------------------
+  - Method: EoH
+  - _max_generations: 4
+  - _max_sample_nums: 8
+  - _pop_size: 6
+  - _selection_num: 3
+  - _use_e2_operator: True
+  - _use_m1_operator: True
+  - _use_m2_operator: True
+  - _num_samplers: 1
+  - _num_evaluators: 1
+  - _resume_mode: False
+  - _debug_mode: False
+  - _multi_thread_or_process_eval: thread
+  - _function_to_evolve_name: algorithm
+  - _tot_sample_nums: 0
+  - _initial_sample_nums_max: 8
+  - _evaluation_executor: <concurrent.futures.thread.ThreadPoolExecutor object at 0x000002A67D68FD40>
+=====================================================================
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(candidate, lb, ub):
+        return np.clip(candidate, lb, ub)
+
+    def differential_evolution(population_size, mutation_factor, crossover_probability, iteration):
+        population = rng.uniform(lb, ub, size=(population_size, dim))
+        for _ in range(iteration):
+            differences = population[np.random.choice(population_size, 3, replace=False), :] - population
+            mutant = (differences[0] * mutation_factor + differences[1] + differences[2]) / 3
+            trial = np.where(rng.uniform(0, 1, size=dim) < crossover_probability,
+                             mutant,
+                             population[np.random.choice(population_size, replace=False)])
+            trial = clip(trial, lb, ub)
+            fitness = func(trial)
+            index = np.argmin(func(population))
+            if fitness < func(population[index]):
+                population[index] = trial
+        return np.argmin(func(population))
+
+    def local_search(iteration):
+        best_solution = rng.uniform(lb, ub)
+        for _ in range(iteration):
+            candidate = best_solution + rng.uniform(-1, 1, size=dim)
+            candidate = clip(candidate, lb, ub)
+            fitness = func(candidate)
+            if fitness < func(best_solution):
+                best_solution = candidate
+        return best_solution
+
+    iteration_de = int(budget / (2 * dim))
+    iteration_ls = budget - 2 * dim * iteration_de
+
+    index_best = differential_evolution(20, 0.5, 0.7, iteration_de)
+    best_solution = clip(population[index_best], lb, ub)
+
+    return local_search(iteration_ls)
+------------------------------------------------------
+Score        : None
+Sample time  : 43.766414642333984
+Evaluate time: 0.203169584274292
+Sample orders: 1
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    x = np.random.uniform(lb, ub, (1, dim))
+    t = 1
+    current_best = func(x)
+    N = int(budget / (dim * (ub - lb)))
+    
+    for _ in range(N):
+        for i in range(dim):
+            mu = np.zeros_like(x)
+            sigma = 0.5
+            while True:
+                new_x = x + rng.randn(1, dim) * sigma
+                new_x = np.clip(new_x, lb, ub)
+                
+                f_new = func(new_x)
+                if f_new < current_best or rng.rand() < np.exp((current_best - f_new) / t):
+                    x = new_x
+                    current_best = min(current_best, f_new)
+                    
+                    mu[i] += (new_x[i] - x[i]) / N
+                    sigma = 0.1 * rng.randn()
+                    break
+                    
+                elif sigma < 10e-6:
+                    mu[i] += (new_x[i] - x[i]) / N
+                    sigma *= np.sqrt(2)
+                    break
+                
+                t *= 0.99
+    return x
+------------------------------------------------------
+Score        : None
+Sample time  : 36.971667528152466
+Evaluate time: 0.21184587478637695
+Sample orders: 2
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(candidate):
+        return np.clip(candidate, lb, ub)
+
+    def evaluate(candidate):
+        return func(candidate)
+
+    def cma_es(population, sigma):
+        num_parents = int(0.1 * len(population))
+        parents = population[np.argsort(-np.array([evaluate(x) for x in population]))[:num_parents]]
+        cov = np.cov(np.transpose(parents), bias=True)
+        weights = (cov ** (-0.5)) / np.sum(cov ** (-0.5))
+        new_population = parents + sigma * np.random.multivariate_normal(np.zeros(dim), weights)
+        return clip(new_population)
+
+    def simulated_annealing(best, current):
+        T = 1
+        while True:
+            if rng.uniform(0, 1) < np.exp((evaluate(current) - evaluate(best)) / T):
+                best = current
+            T *= 0.99
+            if T < 1e-5 or not budget:
+                return
+
+    population = clip(rng.uniform(lb, ub, size=(budget, dim)))
+    for _ in range(budget * 10):  # Increase the number of iterations to improve results
+        population = cma_es(population, sigma=0.1)
+        best = np.max(np.array([evaluate(x) for x in population]))
+        current = rng.choice(population[np.argmax(np.array([evaluate(x) for x in population]))])
+        simulated_annealing(best, current)
+
+    return clip(np.array([evaluate(x) for x in population])[np.argmax(np.array([evaluate(x) for x in population]))])
+------------------------------------------------------
+Score        : None
+Sample time  : 42.87705755233765
+Evaluate time: 0.30152249336242676
+Sample orders: 3
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    x_best = np.random.uniform(lb, ub, size=dim)
+    f_best = func(x_best)
+
+    n_search = int(budget * 0.9 / dim)
+    n_local = budget - n_search
+
+    for _ in range(n_search):
+        x_rand = np.clip(np.random.uniform(lb, ub, size=dim), lb, ub)
+        x_new = np.clip(x_rand + rng.normal(size=(dim,)), lb, ub)
+        f_new = func(x_new)
+
+        if f_new < f_best:
+            x_best = x_new
+            f_best = f_new
+
+    for _ in range(n_local):
+        x_current = np.copy(x_best)
+        for i in range(dim):
+            step_size = rng.uniform(0.1, 2.5)
+            x_current[i] += rng.normal(size=(1,))
+            x_current[i] = np.clip(x_current[i], lb, ub)
+
+            f_current = func(x_current)
+            if f_current < f_best:
+                x_best = x_current
+                f_best = f_current
+
+    return x_best
+------------------------------------------------------
+Score        : None
+Sample time  : 32.41887450218201
+Evaluate time: 0.25009584426879883
+Sample orders: 4
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    pop_size = 100
+    num_gens = int(budget / (dim * 10))
+    cross_prob = 0.8
+    mut_prob = 0.1
+
+    # Initialize particles with random positions within the bounds
+    particles = np.random.uniform(lb, ub, (pop_size, dim))
+
+    for gen in range(num_gens):
+        # Evaluate fitness of each particle using the given function
+        fitness = func(particles)
+
+        # Sort particles by their fitness and select parents
+        sorted_particles = np.argsort(fitness)
+        parents = particles[sorted_particles[:int(pop_size * 0.2)]]
+
+        # Generate offspring through crossover and mutation
+        offspring = []
+        for i in range(int(pop_size * 0.8)):
+            parent1, parent2 = rng.choice(parents, size=2, replace=False)
+            child = (parent1 + parent2) / 2
+            if rng.random() < cross_prob:
+                idx = rng.randint(0, dim - 1)
+                child[idx] = np.mean([parent1[idx], parent2[idx]])
+            if rng.random() < mut_prob:
+                idx = rng.randint(0, dim - 1)
+                child[idx] += rng.uniform(-ub, ub) / (gen + 1)
+            offspring.append(child)
+
+        # Update particles with new offspring
+        particles[sorted_particles[int(pop_size * 0.2):]] = np.array(offspring)
+
+    # Evaluate fitness of all particles and return the best one
+    fitness = func(particles)
+    sorted_particles = np.argsort(fitness)
+    return particles[sorted_particles[-1]]
+------------------------------------------------------
+Score        : None
+Sample time  : 48.782920360565186
+Evaluate time: 0.20782065391540527
+Sample orders: 5
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    def clip(x):
+        return np.clip(x, lb, ub)
+
+    x_best = np.random.uniform(lb, ub, size=dim)
+    f_best = func(x_best)
+
+    for _ in range(budget):
+        if rng.rand() < 0.1:
+            z = rng.randn(dim)
+            y = clip(x_best + 0.5 * z / np.linalg.norm(z))
+            f_y = func(y)
+            if f_y < f_best:
+                x_best, f_best = y, f_y
+
+        n = rng.randint(1, dim)
+        z = rng.randn(n) - 0.5
+        u = clip(x_best + 0.2 * np.dot(z, (ub - lb)) / np.linalg.norm(z))
+        f_u = func(u)
+        if f_u < f_best:
+            x_best, f_best = u, f_u
+
+    return x_best
+------------------------------------------------------
+Score        : None
+Sample time  : 27.193163871765137
+Evaluate time: 0.21279263496398926
+Sample orders: 6
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    X = rng.uniform(lb, ub, size=(budget, dim))
+    y = [func(x) for x in X]
+
+    # Define the kernel and GP model parameters
+    sigma_noise = 1e-6
+    length_scale = 0.5
+    signal_variance = 1.0
+
+    # Main loop of GPO algorithm
+    for i in range(10): # number of iterations
+        mean, var = gp_model(X, y, length_scale=length_scale, sigma_noise=sigma_noise)
+        next_x = sample_next_point(X, y, mean, var, rng=rng)
+        
+        if func(next_x) < min(y):
+            X = np.vstack((X, next_x))
+            y.append(func(next_x))
+
+    # Return the best solution found
+    idx_best = np.argmin(y)
+    return X[idx_best]
+------------------------------------------------------
+Score        : None
+Sample time  : 53.321146965026855
+Evaluate time: 0.31102657318115234
+Sample orders: 7
+------------------------------------------------------
+Current best score: -inf
+======================================================
+
+================= Evaluated Function =================
+def algorithm(func, dim, lb, ub, budget, rng):
+    sigma = 0.5  # initial standard deviation
+    mu = np.random.uniform(lb, ub, size=dim)  # initial mean
+    c1 = 1 / (dim + 1.25)
+    c2 = 2 / ((dim + 1.25) ** 2)
+    ccov = np.eye(dim)
+
+    for _ in range(budget):
+        z = np.random.multivariate_normal(mu, sigma**2 * ccov)
+        candidate = mu + z
+        clipped_candidate = np.clip(candidate, lb, ub)
+        
+        if func(clipped_candidate) < func(mu):
+            mu = clipped_candidate
+            ccov = (1 - c1 - c2) * ccov + c2 * np.outer(z, z)
+
+    return mu
+------------------------------------------------------
+Score        : -42603.48679133763
+Sample time  : 29.048446893692017
+Evaluate time: 1.4815471172332764
+Sample orders: 8
+------------------------------------------------------
+Current best score: -42603.48679133763
+======================================================
+
+Note: During initialization, EoH gets 1 algorithms after 8 trails.
+The search is terminated since EoH unable to obtain 3 feasible algorithms during initialization. Please increase the `initial_sample_nums_max` argument (currently 8). Please also check your evaluation implementation and LLM implementation.
+{"framework": "llm4ad", "task": "rosenbrock_5d", "seed": 2081821325, "best_value": 42603.48679133763, "success": true, "error": null, "elapsed_sec": 317.742, "timestamp": "2026-05-20T06:10:17.922632Z", "extra": {"log_dir": "C:\\Users\\ailab\\Downloads\\LLM_Evolutionary_benchmarks\\LLM_Evolutionary_benchmarks\\benchmark_results\\self_evolving_all3_true_final_final_live\\llm4ad_logs\\rosenbrock_5d\\seed2081821325\\attempt1", "attempt": 1, "repo_path": "C:\\Users\\ailab\\Downloads\\LLM_Evolutionary_benchmarks\\LLM_Evolutionary_benchmarks\\LLM4AD", "llm_call_count": 8, "configured_eval_upper_bound": 32, "budget_explanation": "max_sample_nums x max_generations x attempts is the configured upper-bound for candidate evaluations."}}
